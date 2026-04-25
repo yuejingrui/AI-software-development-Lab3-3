@@ -9,6 +9,7 @@ class ErrorCode:
     UNKNOWN: int = 1000
     VALIDATION: int = 1001
     HTTP: int = 1002
+    NOT_FOUND: int = 1003
     DB: int = 2000
 
 
@@ -18,4 +19,3 @@ class AppError(Exception):
         self.code = code
         self.message = message
         self.http_status = http_status
-

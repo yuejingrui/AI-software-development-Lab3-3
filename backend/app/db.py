@@ -31,6 +31,20 @@ def init_db() -> None:
             );
             """.strip()
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plans (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              title TEXT NOT NULL,
+              date TEXT NOT NULL,
+              budget REAL NOT NULL,
+              people_count INTEGER NOT NULL,
+              preferences TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            """.strip()
+        )
         conn.commit()
 
 
