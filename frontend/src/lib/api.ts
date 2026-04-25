@@ -6,7 +6,7 @@ function getBaseUrl(): string {
   return env && env.trim().length > 0 ? env : "http://127.0.0.1:8000";
 }
 
-async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT", payload?: unknown): Promise<T> {
+async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE", payload?: unknown): Promise<T> {
   const url = `${getBaseUrl()}${path}`;
   try {
     const res = await fetch(url, {
@@ -39,4 +39,8 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
 
 export async function apiPut<T>(path: string, body: unknown): Promise<T> {
   return apiRequest<T>(path, "PUT", body);
+}
+
+export async function apiDelete<T>(path: string): Promise<T> {
+  return apiRequest<T>(path, "DELETE");
 }

@@ -45,6 +45,27 @@ def init_db() -> None:
             );
             """.strip()
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS places (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              plan_id INTEGER NOT NULL,
+              name TEXT NOT NULL,
+              address TEXT NOT NULL,
+              longitude REAL NOT NULL,
+              latitude REAL NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (plan_id) REFERENCES plans (id)
+            );
+            """.strip()
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_places_plan_id
+            ON places (plan_id);
+            """.strip()
+        )
         conn.commit()
 
 
