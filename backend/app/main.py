@@ -88,6 +88,18 @@ class MapSearchItem(BaseModel):
     latitude: float
 
 
+class MapReverseGeocodeData(BaseModel):
+    name: str
+    address: str
+
+
+class MapNearbyPoiData(BaseModel):
+    name: str
+    address: str
+    longitude: float
+    latitude: float
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -414,8 +426,8 @@ def create_app() -> FastAPI:
             )
         return ok(data)
 
-    @app.get("/map/reverse-geocode", response_model=ApiResponse[str])
-    def map_reverse_geocode(longitude: float, latitude: float) -> ApiResponse[str]:
+    @app.get("/map/reverse-geocode", response_model=ApiResponse[MapReverseGeocodeData])
+    def map_reverse_geocode(longitude: float, latitude: float) -> ApiResponse[MapReverseGeocodeData]:
         _ensure_map_config_ready()
         if longitude < -180 or longitude > 180 or latitude < -90 or latitude > 90:
             raise AppError(code=ErrorCode.VALIDATION, message="经纬度范围非法", http_status=422)
@@ -424,13 +436,76 @@ def create_app() -> FastAPI:
             {
                 "key": YourWebServiceKey,
                 "location": f"{longitude},{latitude}",
-                "extensions": "base",
+                "extensions": "all",
             },
         )
         if body.get("status") != "1":
             raise AppError(code=ErrorCode.HTTP, message=body.get("info", "逆地理解析失败"), http_status=502)
-        address = ((body.get("regeocode") or {}).get("formatted_address") or "").strip()
-        return ok(address)
+        regeocode = body.get("regeocode") or {}
+        formatted_address = str(regeocode.get("formatted_address") or "").strip()
+        address_component = regeocode.get("addressComponent") or {}
+        street_number = address_component.get("streetNumber") or {}
+        pois = regeocode.get("pois") or []
+
+        poi_name = ""
+        poi_address = ""
+        if pois:
+            first_poi = pois[0] or {}
+            poi_name = str(first_poi.get("name") or "").strip()
+            poi_address = str(first_poi.get("address") or "").strip()
+
+        building_name = str((address_component.get("building") or {}).get("name") or "").strip()
+        neighborhood_name = str((address_component.get("neighborhood") or {}).get("name") or "").strip()
+        street = str(street_number.get("street") or "").strip()
+        number = str(street_number.get("number") or "").strip()
+
+        doorplate = (f"{street}{number}").strip()
+        if not doorplate:
+            doorplate = number or street
+
+        name = poi_name or building_name or neighborhood_name or doorplate or formatted_address or "未命名地点"
+        address = doorplate or poi_address or formatted_address or "地址未知"
+        return ok(MapReverseGeocodeData(name=name, address=address))
+
+    @app.get("/map/nearby-poi", response_model=ApiResponse[MapNearbyPoiData | None])
+    def map_nearby_poi(longitude: float, latitude: float) -> ApiResponse[MapNearbyPoiData | None]:
+        _ensure_map_config_ready()
+        if longitude < -180 or longitude > 180 or latitude < -90 or latitude > 90:
+            raise AppError(code=ErrorCode.VALIDATION, message="经纬度范围非法", http_status=422)
+        body = _amap_get(
+            "/v3/place/around",
+            {
+                "key": YourWebServiceKey,
+                "location": f"{longitude},{latitude}",
+                "radius": "120",
+                "offset": "1",
+                "page": "1",
+                "extensions": "base",
+            },
+        )
+        if body.get("status") != "1":
+            raise AppError(code=ErrorCode.HTTP, message=body.get("info", "周边地点查询失败"), http_status=502)
+        pois = body.get("pois") or []
+        if not pois:
+            return ok(None)
+        first = pois[0] or {}
+        location = str(first.get("location") or "").strip()
+        parts = location.split(",")
+        if len(parts) != 2:
+            return ok(None)
+        try:
+            poi_longitude = float(parts[0])
+            poi_latitude = float(parts[1])
+        except Exception:
+            return ok(None)
+        return ok(
+            MapNearbyPoiData(
+                name=str(first.get("name") or "未命名地点").strip(),
+                address=str(first.get("address") or "地址未知").strip(),
+                longitude=poi_longitude,
+                latitude=poi_latitude,
+            )
+        )
 
     return app
 

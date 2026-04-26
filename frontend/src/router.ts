@@ -7,7 +7,7 @@ import PlansListView from "./views/PlansListView.vue";
 export const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: "/", redirect: "/plans" },
+    { path: "/", redirect: "/plans/new" },
     { path: "/plans", name: "plans-list", component: PlansListView },
     { path: "/plans/new", name: "plans-create", component: PlanCreateView },
     { path: "/plans/:id", name: "plans-detail", component: PlanDetailView },

@@ -2,7 +2,7 @@
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import PlanForm from "../components/PlanForm.vue";
-import { assertAmapKeyReady, loadAmapSdk, reverseGeocode, searchPoi } from "../lib/amap";
+import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
 import type { Place, PlacePayload } from "../types/place";
@@ -62,6 +62,8 @@ const searchKeyword = ref("");
 const searchLoading = ref(false);
 const searchError = ref<string | null>(null);
 const searchResults = ref<PlacePayload[]>([]);
+const HOTSPOT_CLICK_SUPPRESS_MS = 300;
+let lastHotspotClickAt = 0;
 
 const planPlaces = ref<Place[]>([]);
 const allPlaces = ref<Place[]>([]);
@@ -97,12 +99,6 @@ function validatePlace(payload: PlacePayload): boolean {
   const nextErrors: PlaceFieldErrors = {};
   if (!payload.name.trim()) nextErrors.name = "请输入地点名称";
   if (!payload.address.trim()) nextErrors.address = "请输入地点地址";
-  if (!Number.isFinite(payload.longitude) || payload.longitude < -180 || payload.longitude > 180) {
-    nextErrors.longitude = "经度范围应在 -180 到 180";
-  }
-  if (!Number.isFinite(payload.latitude) || payload.latitude < -90 || payload.latitude > 90) {
-    nextErrors.latitude = "纬度范围应在 -90 到 90";
-  }
   placeErrors.value = nextErrors;
   return Object.keys(nextErrors).length === 0;
 }
@@ -177,23 +173,48 @@ function clearPlaceMarkers(): void {
   placeMarkerMap.clear();
 }
 
+function hidePickMarker(): void {
+  if (!mapInstance || !pickMarker) return;
+  mapInstance.remove(pickMarker);
+  pickMarker = null;
+}
+
 function updatePickMarker(payload: PlacePayload): void {
   if (!mapInstance) return;
+  const markerLabel = payload.name.trim() || payload.address.trim() || "未命名地点";
   if (!pickMarker) {
     pickMarker = new window.AMap!.Marker({
       position: [payload.longitude, payload.latitude],
-      label: { content: "待加入地点", direction: "top" },
+      label: { content: markerLabel, direction: "top" },
     });
     mapInstance.add(pickMarker);
     return;
   }
   pickMarker.setPosition([payload.longitude, payload.latitude]);
+  pickMarker.setLabel?.({ content: markerLabel, direction: "top" });
 }
 
-function centerToPlace(payload: PlacePayload, zoom = 14): void {
+function centerToPlace(payload: PlacePayload, zoom = 14, showPickMarker = true): void {
   if (!mapInstance) return;
   mapInstance.setZoomAndCenter(zoom, [payload.longitude, payload.latitude]);
-  updatePickMarker(payload);
+  if (showPickMarker) {
+    updatePickMarker(payload);
+    return;
+  }
+  hidePickMarker();
+}
+
+function ensureMapCenteredInViewport(): void {
+  const container = document.getElementById(mapContainerId);
+  if (!container) return;
+  const rect = container.getBoundingClientRect();
+  const fullyVisible =
+    rect.top >= 0 &&
+    rect.left >= 0 &&
+    rect.bottom <= window.innerHeight &&
+    rect.right <= window.innerWidth;
+  if (fullyVisible) return;
+  container.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
 }
 
 function renderAllPlaceMarkers(): void {
@@ -209,24 +230,55 @@ function renderAllPlaceMarkers(): void {
       },
     });
     marker.on?.("click", () => {
-      centerToPlace(place);
+      locatePlace(place);
     });
     placeMarkerMap.set(place.id, marker);
     mapInstance.add(marker);
   }
 }
 
-async function onMapPicked(longitude: number, latitude: number): Promise<void> {
-  placeDraft.longitude = Number(longitude.toFixed(6));
-  placeDraft.latitude = Number(latitude.toFixed(6));
-  if (!placeDraft.name.trim()) {
-    placeDraft.name = `地点 ${placeDraft.longitude}, ${placeDraft.latitude}`;
+type MapPickPayload = {
+  longitude: number;
+  latitude: number;
+  name: string;
+  address: string;
+  source: "hotspot" | "map";
+};
+
+async function onMapPicked(pick: MapPickPayload): Promise<void> {
+  const hadEditingPlace = editingPlaceId.value !== null;
+  if (hadEditingPlace) {
+    editingPlaceId.value = null;
+    placeTip.value = "已取消当前已选地点，可直接加入新地点";
   }
-  const addr = await reverseGeocode(placeDraft.longitude, placeDraft.latitude);
-  if (addr) {
-    placeDraft.address = addr;
+  placeDraft.longitude = Number(pick.longitude.toFixed(6));
+  placeDraft.latitude = Number(pick.latitude.toFixed(6));
+  try {
+    const geocode = await reverseGeocode(placeDraft.longitude, placeDraft.latitude);
+    if (pick.source === "hotspot") {
+      placeDraft.name = pick.name || geocode.name || geocode.address || "未命名地点";
+      placeDraft.address = pick.address || geocode.address || geocode.name || "地址未知";
+    } else {
+      const nearby = await nearbyPoi(placeDraft.longitude, placeDraft.latitude);
+      placeDraft.name = pick.name || nearby?.name?.trim() || geocode.name || geocode.address || "未命名地点";
+      placeDraft.address = pick.address || nearby?.address?.trim() || geocode.address || geocode.name || "地址未知";
+    }
+  } catch (e) {
+    placeDraft.name = pick.name || "未命名地点";
+    placeDraft.address = pick.address || "地址未知";
+    placeError.value = e instanceof Error ? e.message : "地点解析失败";
   }
   centerToPlace(placeDraft);
+  ensureMapCenteredInViewport();
+}
+
+function parseMapPickEvent(event: any, source: "hotspot" | "map"): MapPickPayload | null {
+  const longitude = Number(event?.lnglat?.lng ?? event?.lnglat?.getLng?.());
+  const latitude = Number(event?.lnglat?.lat ?? event?.lnglat?.getLat?.());
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return null;
+  const name = String(event?.poi?.name ?? event?.name ?? "").trim();
+  const address = String(event?.poi?.address ?? event?.poi?.addr ?? event?.address ?? "").trim();
+  return { longitude, latitude, name, address, source };
 }
 
 async function initMap(): Promise<void> {
@@ -252,22 +304,30 @@ async function initMap(): Promise<void> {
     zoom: 11,
     center: [placeDraft.longitude, placeDraft.latitude],
     resizeEnable: true,
+    isHotspot: true,
+    features: ["bg", "road", "building", "point"],
+  });
+  mapInstance.on("hotspotclick", (event: any) => {
+    const parsed = parseMapPickEvent(event, "hotspot");
+    if (!parsed) return;
+    lastHotspotClickAt = Date.now();
+    onMapPicked(parsed);
   });
   mapInstance.on("click", (event: any) => {
-    const longitude = Number(event?.lnglat?.lng ?? event?.lnglat?.getLng?.());
-    const latitude = Number(event?.lnglat?.lat ?? event?.lnglat?.getLat?.());
-    if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) return;
-    onMapPicked(longitude, latitude);
+    if (Date.now() - lastHotspotClickAt < HOTSPOT_CLICK_SUPPRESS_MS) return;
+    const parsed = parseMapPickEvent(event, "map");
+    if (!parsed) return;
+    onMapPicked(parsed);
   });
   mapReady.value = true;
 }
 
-function setPlaceDraft(place: PlacePayload): void {
+function setPlaceDraft(place: PlacePayload, showPickMarker = true): void {
   placeDraft.name = place.name;
   placeDraft.address = place.address;
   placeDraft.longitude = place.longitude;
   placeDraft.latitude = place.latitude;
-  centerToPlace(placeDraft);
+  centerToPlace(placeDraft, 14, showPickMarker);
 }
 
 function resetPlaceForm(): void {
@@ -285,7 +345,7 @@ function startEditPlace(place: Place): void {
     address: place.address,
     longitude: place.longitude,
     latitude: place.latitude,
-  });
+  }, false);
   placeTip.value = `正在编辑地点 #${place.id}`;
 }
 
@@ -394,7 +454,7 @@ function locatePlace(place: Place): void {
     address: place.address,
     longitude: place.longitude,
     latitude: place.latitude,
-  });
+  }, false);
 }
 
 onMounted(async () => {
@@ -503,16 +563,6 @@ onBeforeUnmount(() => {
               <input v-model.trim="placeDraft.address" type="text" maxlength="200" :disabled="placeSaving" />
               <span v-if="placeErrors.address" class="field-error">{{ placeErrors.address }}</span>
             </label>
-            <label>
-              经度
-              <input v-model.number="placeDraft.longitude" type="number" step="0.000001" :disabled="placeSaving" />
-              <span v-if="placeErrors.longitude" class="field-error">{{ placeErrors.longitude }}</span>
-            </label>
-            <label>
-              纬度
-              <input v-model.number="placeDraft.latitude" type="number" step="0.000001" :disabled="placeSaving" />
-              <span v-if="placeErrors.latitude" class="field-error">{{ placeErrors.latitude }}</span>
-            </label>
           </div>
 
           <div class="actions">
@@ -527,7 +577,7 @@ onBeforeUnmount(() => {
             </button>
             <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm">取消编辑</button>
             <button type="button" class="btn" :disabled="placeSaving" @click="centerToPlace(placeDraft)">
-              在地图中显示待选点
+              在地图中显示选中地点
             </button>
           </div>
         </form>
@@ -631,7 +681,8 @@ h3 {
 }
 .map {
   width: 100%;
-  min-height: 360px;
+  aspect-ratio: 2 / 1;
+  min-height: 300px;
   border-radius: 10px;
   border: 1px solid #e5e7eb;
   overflow: hidden;

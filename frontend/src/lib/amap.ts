@@ -8,6 +8,18 @@ type SearchCandidate = {
   latitude: number;
 };
 
+export type ReverseGeocodeResult = {
+  name: string;
+  address: string;
+};
+
+export type NearbyPoiResult = {
+  name: string;
+  address: string;
+  longitude: number;
+  latitude: number;
+};
+
 let sdkPromise: Promise<AMapGlobal> | null = null;
 let mapConfigPromise: Promise<{ js_key: string; security_js_code: string }> | null = null;
 
@@ -56,10 +68,18 @@ export async function searchPoi(keyword: string): Promise<SearchCandidate[]> {
   return apiGet<SearchCandidate[]>(`/map/search?${qs.toString()}`);
 }
 
-export async function reverseGeocode(longitude: number, latitude: number): Promise<string> {
+export async function reverseGeocode(longitude: number, latitude: number): Promise<ReverseGeocodeResult> {
   const qs = new URLSearchParams({
     longitude: String(longitude),
     latitude: String(latitude),
   });
-  return apiGet<string>(`/map/reverse-geocode?${qs.toString()}`);
+  return apiGet<ReverseGeocodeResult>(`/map/reverse-geocode?${qs.toString()}`);
+}
+
+export async function nearbyPoi(longitude: number, latitude: number): Promise<NearbyPoiResult | null> {
+  const qs = new URLSearchParams({
+    longitude: String(longitude),
+    latitude: String(latitude),
+  });
+  return apiGet<NearbyPoiResult | null>(`/map/nearby-poi?${qs.toString()}`);
 }
