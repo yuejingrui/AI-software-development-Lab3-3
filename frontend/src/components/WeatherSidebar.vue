@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { fetchWeatherByLocation } from "../lib/weather";
+import { fetchPlanRiskCheck } from "../lib/risk";
+import type { PlanRiskCheck } from "../types/risk";
 import type { WeatherByLocation, WeatherForecastDay } from "../types/weather";
 
 const props = defineProps<{
+  planId: number | null;
+  riskReloadKey: number;
   longitude: number;
   latitude: number;
   placeName: string;
@@ -13,6 +17,9 @@ const props = defineProps<{
 const loading = ref(false);
 const loadError = ref<string | null>(null);
 const weather = ref<WeatherByLocation | null>(null);
+const riskLoading = ref(false);
+const riskLoadError = ref<string | null>(null);
+const riskCheck = ref<PlanRiskCheck | null>(null);
 
 const chartWidth = 320;
 const chartHeight = 220;
@@ -83,6 +90,26 @@ const hasPlanDateForecast = computed(() => {
   return displayForecast.value.some((item) => item.date === props.planDate);
 });
 
+const budgetLevelText = computed(() => {
+  const level = riskCheck.value?.budget_risk.level;
+  if (level === "budget_ample") return "预算充裕";
+  if (level === "budget_tight") return "预算紧张";
+  if (level === "budget_over") return "建议增加预算";
+  return "预算评估中";
+});
+
+const budgetLevelClass = computed(() => {
+  const level = riskCheck.value?.budget_risk.level;
+  if (level === "budget_ample") return "ok";
+  if (level === "budget_tight") return "warn";
+  return "danger";
+});
+
+function formatMoney(amount: number): string {
+  if (!Number.isFinite(amount)) return "-";
+  return `¥${amount.toFixed(2)}`;
+}
+
 async function loadWeather(): Promise<void> {
   loading.value = true;
   loadError.value = null;
@@ -96,10 +123,36 @@ async function loadWeather(): Promise<void> {
   }
 }
 
+async function loadRiskCheck(): Promise<void> {
+  if (props.planId === null || props.planId < 1) {
+    riskCheck.value = null;
+    riskLoadError.value = null;
+    return;
+  }
+  riskLoading.value = true;
+  riskLoadError.value = null;
+  try {
+    riskCheck.value = await fetchPlanRiskCheck(props.planId);
+  } catch (e) {
+    riskCheck.value = null;
+    riskLoadError.value = e instanceof Error ? e.message : "规则检查失败";
+  } finally {
+    riskLoading.value = false;
+  }
+}
+
 watch(
   () => [props.longitude, props.latitude],
   () => {
     loadWeather();
+  },
+  { immediate: true }
+);
+
+watch(
+  () => [props.planId, props.riskReloadKey],
+  () => {
+    loadRiskCheck();
   },
   { immediate: true }
 );
@@ -178,6 +231,43 @@ watch(
         </svg>
         <p v-if="hasPlanDate && !hasPlanDateForecast" class="status warn">暂无该日的天气信息</p>
       </section>
+
+      <section class="risk-panel">
+        <div class="risk-header">
+          <h3>风险提示区</h3>
+          <button type="button" class="btn" :disabled="riskLoading" @click="loadRiskCheck">
+            {{ riskLoading ? "检查中..." : "刷新检查" }}
+          </button>
+        </div>
+
+        <p v-if="riskLoadError" class="status error">{{ riskLoadError }}</p>
+        <p v-else-if="riskLoading" class="status">规则检查中...</p>
+        <template v-else-if="riskCheck">
+          <div class="risk-item">
+            <p class="risk-title">预算风险</p>
+            <p class="risk-value" :class="budgetLevelClass">{{ budgetLevelText }}</p>
+            <p class="risk-meta">
+              预计总消费 {{ formatMoney(riskCheck.budget_risk.estimated_total) }} / 预算
+              {{ formatMoney(riskCheck.budget_risk.budget) }}
+            </p>
+            <p class="risk-meta">按地点消费 × 人数（{{ riskCheck.budget_risk.people_count }} 人）估算</p>
+            <p v-if="riskCheck.budget_risk.missing_cost_places > 0" class="status warn">
+              有 {{ riskCheck.budget_risk.missing_cost_places }} 个地点暂无 cost 数据，估算可能偏低
+            </p>
+          </div>
+
+          <div class="risk-item">
+            <p class="risk-title">雨天户外风险</p>
+            <p class="risk-value" :class="riskCheck.weather_risk.has_rain_or_snow ? 'warn' : 'ok'">
+              {{ riskCheck.weather_risk.suggestion }}
+            </p>
+            <p v-if="riskCheck.weather_risk.matched_weather" class="risk-meta">
+              规划日天气：{{ riskCheck.weather_risk.matched_weather }}
+            </p>
+            <p v-if="!riskCheck.weather_risk.has_forecast_for_plan_date" class="status warn">规划日期暂无可用天气预报</p>
+          </div>
+        </template>
+      </section>
     </template>
   </aside>
 </template>
@@ -243,6 +333,50 @@ h3 {
 .forecast {
   display: grid;
   gap: 8px;
+}
+.risk-panel {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #e5e7eb;
+  padding-top: 10px;
+}
+.risk-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.risk-item {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+  background: #f9fafb;
+}
+.risk-title {
+  margin: 0;
+  color: #374151;
+  font-size: 13px;
+}
+.risk-value {
+  margin: 0;
+  font-weight: 700;
+  color: #111827;
+}
+.risk-value.ok {
+  color: #166534;
+}
+.risk-value.warn {
+  color: #b45309;
+}
+.risk-value.danger {
+  color: #b91c1c;
+}
+.risk-meta {
+  margin: 0;
+  color: #4b5563;
+  font-size: 13px;
 }
 .chart {
   width: 100%;

@@ -165,6 +165,29 @@ class WeatherByLocationData(BaseModel):
     forecast: list[WeatherForecastDayData]
 
 
+class BudgetRiskData(BaseModel):
+    level: str
+    suggestion: str
+    estimated_total: float
+    budget: float
+    ratio: float
+    people_count: int
+    priced_places: int
+    missing_cost_places: int
+
+
+class WeatherRiskData(BaseModel):
+    has_forecast_for_plan_date: bool
+    has_rain_or_snow: bool
+    suggestion: str
+    matched_weather: str | None = None
+
+
+class PlanRiskCheckData(BaseModel):
+    budget_risk: BudgetRiskData
+    weather_risk: WeatherRiskData
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -218,6 +241,71 @@ def _load_place(place_id: int) -> PlaceData:
         if row is None:
             raise AppError(code=ErrorCode.NOT_FOUND, message="地点不存在", http_status=404)
         return _map_place_row(row)
+
+
+def _load_plan(plan_id: int) -> PlanData:
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if row is None:
+            raise AppError(code=ErrorCode.NOT_FOUND, message="规划不存在", http_status=404)
+        return _map_plan_row(row)
+
+
+def _load_plan_places(plan_id: int) -> list[PlaceData]:
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT places.*, plans.title AS plan_title
+            FROM places
+            JOIN plans ON plans.id = places.plan_id
+            WHERE places.plan_id = ?
+            ORDER BY places.updated_at DESC, places.id DESC
+            """.strip(),
+            (plan_id,),
+        ).fetchall()
+        return [_map_place_row(row) for row in rows]
+
+
+def _load_plan_risk_check_cache(plan_id: int) -> PlanRiskCheckData | None:
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM risk_check_cache
+            WHERE plan_id = ?
+            """.strip(),
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload_json = str(row["payload_json"] or "").strip()
+        if not payload_json:
+            return None
+        try:
+            return PlanRiskCheckData.model_validate_json(payload_json)
+        except Exception:
+            return None
+
+
+def _save_plan_risk_check_cache(plan_id: int, data: PlanRiskCheckData) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO risk_check_cache (plan_id, payload_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(plan_id) DO UPDATE SET
+              payload_json = excluded.payload_json,
+              updated_at = excluded.updated_at
+            """.strip(),
+            (plan_id, data.model_dump_json(), _now_iso()),
+        )
+        conn.commit()
+
+
+def _invalidate_plan_risk_check_cache(plan_id: int) -> None:
+    with db_conn() as conn:
+        conn.execute("DELETE FROM risk_check_cache WHERE plan_id = ?", (plan_id,))
+        conn.commit()
 
 
 def _is_placeholder(value: str) -> bool:
@@ -348,6 +436,21 @@ def _parse_float(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
+def _parse_poi_cost_to_float(raw_cost: Any) -> float | None:
+    text = str(raw_cost or "").strip()
+    if not text:
+        return None
+    if any(token in text for token in ("免费", "无", "暂无")):
+        return 0.0
+    numbers = [_parse_float(item, float("nan")) for item in re.findall(r"\d+(?:\.\d+)?", text)]
+    clean = [value for value in numbers if value == value]
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    return sum(clean) / len(clean)
+
+
 def _wind_power_to_mps(wind_power_text: str) -> float:
     # 高德返回风力等级，需求里要求使用 m/s，这里用蒲福等级近似换算。
     beaufort_to_mps = {
@@ -398,6 +501,175 @@ def _resolve_admin_by_location(longitude: float, latitude: float) -> tuple[str, 
         city = province
     district = str(address_component.get("district") or "").strip() or "未知区县"
     return province, city, district, adcode
+
+
+def _load_weather_forecast_by_adcode(adcode: str) -> list[WeatherForecastDayData]:
+    forecast_body = _amap_get(
+        "/v3/weather/weatherInfo",
+        {
+            "key": YourWebServiceKey,
+            "city": adcode,
+            "extensions": "all",
+        },
+    )
+    if forecast_body.get("status") != "1":
+        raise AppError(code=ErrorCode.HTTP, message=forecast_body.get("info", "天气预报查询失败"), http_status=502)
+    forecasts = forecast_body.get("forecasts") or []
+    casts = (forecasts[0] or {}).get("casts") if forecasts else []
+    cast_rows = casts or []
+    forecast: list[WeatherForecastDayData] = []
+    for cast in cast_rows:
+        row = cast or {}
+        day_weather = str(row.get("dayweather") or "").strip()
+        night_weather = str(row.get("nightweather") or "").strip()
+        weather = day_weather or night_weather or "未知"
+        day_temp = _parse_float(row.get("daytemp"), 0.0)
+        night_temp = _parse_float(row.get("nighttemp"), 0.0)
+        high_temp = max(day_temp, night_temp)
+        low_temp = min(day_temp, night_temp)
+        date_text = str(row.get("date") or "").strip()
+        try:
+            date.fromisoformat(date_text)
+        except ValueError:
+            continue
+        forecast.append(
+            WeatherForecastDayData(
+                date=date_text,
+                weather=weather,
+                high_temp_c=high_temp,
+                low_temp_c=low_temp,
+            )
+        )
+    return forecast
+
+
+def _evaluate_budget_risk(plan: PlanData, places: list[PlaceData]) -> BudgetRiskData:
+    estimated_total = 0.0
+    priced_places = 0
+    for place in places:
+        body = _amap_get(
+            "/v3/place/around",
+            {
+                "key": YourWebServiceKey,
+                "location": f"{place.longitude},{place.latitude}",
+                "radius": "200",
+                "offset": "1",
+                "page": "1",
+                "extensions": "all",
+                "keywords": place.name.strip() or place.address.strip(),
+            },
+        )
+        if body.get("status") != "1":
+            info = str(body.get("info") or "地点消费信息查询失败")
+            # 高德配额/QPS限制时降级处理，避免整页报错。
+            if "EXCEEDED_THE_LIMIT" in info or "LIMIT" in info:
+                continue
+            raise AppError(code=ErrorCode.HTTP, message=info, http_status=502)
+        pois = body.get("pois") or []
+        if not pois:
+            continue
+        cost_value = _parse_poi_cost_to_float((pois[0] or {}).get("cost"))
+        if cost_value is None:
+            continue
+        estimated_total += cost_value * float(plan.people_count)
+        priced_places += 1
+    if places and priced_places == 0:
+        return BudgetRiskData(
+            level="budget_tight",
+            suggestion="预算紧张（消费数据暂不可用，建议稍后重试）",
+            estimated_total=0.0,
+            budget=round(max(0.0, float(plan.budget)), 2),
+            ratio=0.75,
+            people_count=plan.people_count,
+            priced_places=0,
+            missing_cost_places=len(places),
+        )
+    budget = max(0.0, float(plan.budget))
+    ratio = estimated_total / budget if budget > 0 else (1.0 if estimated_total == 0 else 1.06)
+    if ratio < 0.75:
+        level = "budget_ample"
+        suggestion = "预算充裕"
+    elif ratio <= 1.05:
+        level = "budget_tight"
+        suggestion = "预算紧张"
+    else:
+        level = "budget_over"
+        suggestion = "建议增加预算"
+    return BudgetRiskData(
+        level=level,
+        suggestion=suggestion,
+        estimated_total=round(estimated_total, 2),
+        budget=round(budget, 2),
+        ratio=ratio,
+        people_count=plan.people_count,
+        priced_places=priced_places,
+        missing_cost_places=max(0, len(places) - priced_places),
+    )
+
+
+def _evaluate_weather_risk(plan: PlanData, places: list[PlaceData]) -> WeatherRiskData:
+    plan_date_text = plan.date.strip()
+    if not plan_date_text:
+        return WeatherRiskData(
+            has_forecast_for_plan_date=False,
+            has_rain_or_snow=False,
+            suggestion="未设置规划日期，无法判断雨天户外风险",
+        )
+    try:
+        date.fromisoformat(plan_date_text)
+    except ValueError:
+        return WeatherRiskData(
+            has_forecast_for_plan_date=False,
+            has_rain_or_snow=False,
+            suggestion="规划日期格式非法，无法判断雨天户外风险",
+        )
+    if not places:
+        return WeatherRiskData(
+            has_forecast_for_plan_date=False,
+            has_rain_or_snow=False,
+            suggestion="暂无规划地点，无法判断雨天户外风险",
+        )
+    forecast_by_adcode: dict[str, list[WeatherForecastDayData]] = {}
+    try:
+        for place in places:
+            _, _, _, adcode = _resolve_admin_by_location(place.longitude, place.latitude)
+            if adcode not in forecast_by_adcode:
+                forecast_by_adcode[adcode] = _load_weather_forecast_by_adcode(adcode)
+            forecast = forecast_by_adcode[adcode]
+            matched = next((item for item in forecast if item.date == plan_date_text), None)
+            if matched is None:
+                continue
+            risky = ("雨" in matched.weather) or ("雪" in matched.weather)
+            if risky:
+                return WeatherRiskData(
+                    has_forecast_for_plan_date=True,
+                    has_rain_or_snow=True,
+                    suggestion="建议谨慎选择户外活动",
+                    matched_weather=matched.weather,
+                )
+    except AppError as exc:
+        if "EXCEEDED_THE_LIMIT" in exc.message or "LIMIT" in exc.message:
+            return WeatherRiskData(
+                has_forecast_for_plan_date=False,
+                has_rain_or_snow=False,
+                suggestion="天气服务限流，暂无法判断雨天户外风险",
+            )
+        raise
+    # 存在地点但未命中任一日期预报，或命中了但都不含雨雪
+    for forecast in forecast_by_adcode.values():
+        matched = next((item for item in forecast if item.date == plan_date_text), None)
+        if matched is not None:
+            return WeatherRiskData(
+                has_forecast_for_plan_date=True,
+                has_rain_or_snow=False,
+                suggestion="当前预报未见雨雪，可正常安排户外活动",
+                matched_weather=matched.weather,
+            )
+    return WeatherRiskData(
+        has_forecast_for_plan_date=False,
+        has_rain_or_snow=False,
+        suggestion="规划日期暂无天气预报，无法判断雨天户外风险",
+    )
 
 
 def create_app() -> FastAPI:
@@ -478,11 +750,7 @@ def create_app() -> FastAPI:
 
     @app.get("/plans/{plan_id}", response_model=ApiResponse[PlanData])
     def get_plan(plan_id: int) -> ApiResponse[PlanData]:
-        with db_conn() as conn:
-            row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
-            if row is None:
-                raise AppError(code=ErrorCode.NOT_FOUND, message="规划不存在", http_status=404)
-            return ok(_map_plan_row(row))
+        return ok(_load_plan(plan_id))
 
     @app.put("/plans/{plan_id}", response_model=ApiResponse[PlanData])
     def update_plan(plan_id: int, payload: PlanUpdateInput) -> ApiResponse[PlanData]:
@@ -510,7 +778,9 @@ def create_app() -> FastAPI:
             row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
             if row is None:
                 raise AppError(code=ErrorCode.DB, message="读取更新后规划失败", http_status=500)
-            return ok(_map_plan_row(row))
+            plan = _map_plan_row(row)
+        _invalidate_plan_risk_check_cache(plan_id)
+        return ok(plan)
 
     @app.get("/plans", response_model=ApiResponse[list[PlanData]])
     def list_plans() -> ApiResponse[list[PlanData]]:
@@ -540,23 +810,28 @@ def create_app() -> FastAPI:
             )
             conn.commit()
             place_id = int(cursor.lastrowid)
+        _invalidate_plan_risk_check_cache(plan_id)
         return ok(_load_place(place_id))
 
     @app.get("/plans/{plan_id}/places", response_model=ApiResponse[list[PlaceData]])
     def list_plan_places(plan_id: int) -> ApiResponse[list[PlaceData]]:
         _ensure_plan_exists(plan_id)
-        with db_conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT places.*, plans.title AS plan_title
-                FROM places
-                JOIN plans ON plans.id = places.plan_id
-                WHERE places.plan_id = ?
-                ORDER BY places.updated_at DESC, places.id DESC
-                """.strip(),
-                (plan_id,),
-            ).fetchall()
-            return ok([_map_place_row(row) for row in rows])
+        return ok(_load_plan_places(plan_id))
+
+    @app.get("/plans/{plan_id}/risk-check", response_model=ApiResponse[PlanRiskCheckData])
+    def get_plan_risk_check(plan_id: int) -> ApiResponse[PlanRiskCheckData]:
+        _ensure_map_config_ready()
+        _ensure_plan_exists(plan_id)
+        cached = _load_plan_risk_check_cache(plan_id)
+        if cached is not None:
+            return ok(cached)
+        plan = _load_plan(plan_id)
+        places = _load_plan_places(plan_id)
+        budget_risk = _evaluate_budget_risk(plan, places)
+        weather_risk = _evaluate_weather_risk(plan, places)
+        result = PlanRiskCheckData(budget_risk=budget_risk, weather_risk=weather_risk)
+        _save_plan_risk_check_cache(plan_id, result)
+        return ok(result)
 
     @app.get("/places", response_model=ApiResponse[list[PlaceData]])
     def list_places() -> ApiResponse[list[PlaceData]]:
@@ -593,16 +868,23 @@ def create_app() -> FastAPI:
             conn.commit()
             if cursor.rowcount == 0:
                 raise AppError(code=ErrorCode.NOT_FOUND, message="地点不存在", http_status=404)
-        return ok(_load_place(place_id))
+        place = _load_place(place_id)
+        _invalidate_plan_risk_check_cache(place.plan_id)
+        return ok(place)
 
     @app.delete("/places/{place_id}", response_model=ApiResponse[dict[str, bool]])
     def delete_place(place_id: int) -> ApiResponse[dict[str, bool]]:
         with db_conn() as conn:
+            row = conn.execute("SELECT plan_id FROM places WHERE id = ?", (place_id,)).fetchone()
+            if row is None:
+                raise AppError(code=ErrorCode.NOT_FOUND, message="地点不存在", http_status=404)
+            plan_id = int(row["plan_id"])
             cursor = conn.execute("DELETE FROM places WHERE id = ?", (place_id,))
             conn.commit()
             if cursor.rowcount == 0:
                 raise AppError(code=ErrorCode.NOT_FOUND, message="地点不存在", http_status=404)
-            return ok({"deleted": True})
+        _invalidate_plan_risk_check_cache(plan_id)
+        return ok({"deleted": True})
 
     @app.get("/plans/{plan_id}/itinerary", response_model=ApiResponse[list[ItinerarySlotData]])
     def get_plan_itinerary(plan_id: int) -> ApiResponse[list[ItinerarySlotData]]:
@@ -669,6 +951,7 @@ def create_app() -> FastAPI:
                         (slot_id, place_id, place_sort_index, now, now),
                     )
             conn.commit()
+        _invalidate_plan_risk_check_cache(plan_id)
         return ok(_load_plan_itinerary(plan_id))
 
     @app.get("/map/config", response_model=ApiResponse[MapConfigData])
@@ -820,20 +1103,6 @@ def create_app() -> FastAPI:
             raise AppError(code=ErrorCode.HTTP, message="未获取到实时天气信息", http_status=502)
         live = lives[0] or {}
 
-        forecast_body = _amap_get(
-            "/v3/weather/weatherInfo",
-            {
-                "key": YourWebServiceKey,
-                "city": adcode,
-                "extensions": "all",
-            },
-        )
-        if forecast_body.get("status") != "1":
-            raise AppError(code=ErrorCode.HTTP, message=forecast_body.get("info", "天气预报查询失败"), http_status=502)
-        forecasts = forecast_body.get("forecasts") or []
-        casts = (forecasts[0] or {}).get("casts") if forecasts else []
-        cast_rows = casts or []
-
         current = WeatherCurrentData(
             province=province,
             city=city,
@@ -846,29 +1115,7 @@ def create_app() -> FastAPI:
             report_time=str(live.get("reporttime") or "").strip(),
         )
 
-        forecast: list[WeatherForecastDayData] = []
-        for cast in cast_rows:
-            row = cast or {}
-            day_weather = str(row.get("dayweather") or "").strip()
-            night_weather = str(row.get("nightweather") or "").strip()
-            weather = day_weather or night_weather or "未知"
-            day_temp = _parse_float(row.get("daytemp"), 0.0)
-            night_temp = _parse_float(row.get("nighttemp"), 0.0)
-            high_temp = max(day_temp, night_temp)
-            low_temp = min(day_temp, night_temp)
-            date_text = str(row.get("date") or "").strip()
-            try:
-                date.fromisoformat(date_text)
-            except ValueError:
-                continue
-            forecast.append(
-                WeatherForecastDayData(
-                    date=date_text,
-                    weather=weather,
-                    high_temp_c=high_temp,
-                    low_temp_c=low_temp,
-                )
-            )
+        forecast = _load_weather_forecast_by_adcode(adcode)
 
         return ok(
             WeatherByLocationData(

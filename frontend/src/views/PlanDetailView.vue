@@ -70,6 +70,7 @@ let lastHotspotClickAt = 0;
 const planPlaces = ref<Place[]>([]);
 const allPlaces = ref<Place[]>([]);
 const mapScopeSelection = ref<"plan" | "all" | null>(null);
+const riskCheckVersion = ref(0);
 const itineraryLoading = ref(false);
 const itinerarySaving = ref(false);
 const itineraryError = ref<string | null>(null);
@@ -90,6 +91,10 @@ type ItineraryDraftSlot = {
 };
 
 const itinerarySlots = ref<ItineraryDraftSlot[]>([]);
+
+function bumpRiskCheckVersion(): void {
+  riskCheckVersion.value += 1;
+}
 
 function newSlotUid(): string {
   itinerarySlotIdSeed += 1;
@@ -439,6 +444,7 @@ async function submit(): Promise<void> {
     applyPayload(lastSaved, nextPayload);
     updatedAt.value = updated.updated_at;
     saveTip.value = "已保存";
+    bumpRiskCheckVersion();
   } catch (e) {
     submitError.value = e instanceof Error ? e.message : "保存失败";
   } finally {
@@ -683,6 +689,7 @@ async function submitPlace(): Promise<void> {
       placeTip.value = "地点修改成功";
     }
     await loadPlaces();
+    bumpRiskCheckVersion();
     resetPlaceForm();
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "保存地点失败";
@@ -701,6 +708,7 @@ async function removePlace(placeId: number): Promise<void> {
     }
     await loadPlaces();
     await loadItinerary();
+    bumpRiskCheckVersion();
     placeTip.value = "地点已删除";
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "删除地点失败";
@@ -824,6 +832,8 @@ onBeforeUnmount(() => {
       <div class="page-grid">
         <div class="weather-column">
           <WeatherSidebar
+            :plan-id="planId"
+            :risk-reload-key="riskCheckVersion"
             :longitude="placeDraft.longitude"
             :latitude="placeDraft.latitude"
             :place-name="placeDraft.name || placeDraft.address || '未命名地点'"

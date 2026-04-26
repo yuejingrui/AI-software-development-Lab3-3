@@ -93,6 +93,16 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS risk_check_cache (
+              plan_id INTEGER PRIMARY KEY,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (plan_id) REFERENCES plans (id) ON DELETE CASCADE
+            );
+            """.strip()
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_places_plan_id
             ON places (plan_id);
             """.strip()
