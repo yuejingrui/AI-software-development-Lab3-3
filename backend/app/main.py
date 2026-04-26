@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -100,6 +101,34 @@ class MapNearbyPoiData(BaseModel):
     latitude: float
 
 
+class WeatherCurrentData(BaseModel):
+    province: str
+    city: str
+    district: str
+    adcode: str
+    weather: str
+    temperature_c: float
+    wind_direction: str
+    wind_speed_mps: float
+    report_time: str
+
+
+class WeatherForecastDayData(BaseModel):
+    date: str
+    weather: str
+    high_temp_c: float
+    low_temp_c: float
+
+
+class WeatherByLocationData(BaseModel):
+    province: str
+    city: str
+    district: str
+    adcode: str
+    current: WeatherCurrentData
+    forecast: list[WeatherForecastDayData]
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -175,6 +204,65 @@ def _amap_get(path: str, params: dict[str, str]) -> dict[str, Any]:
         raise
     except Exception as exc:
         raise AppError(code=ErrorCode.HTTP, message=f"调用高德服务失败: {exc}", http_status=502) from exc
+
+
+def _parse_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return fallback
+
+
+def _wind_power_to_mps(wind_power_text: str) -> float:
+    # 高德返回风力等级，需求里要求使用 m/s，这里用蒲福等级近似换算。
+    beaufort_to_mps = {
+        0: 0.2,
+        1: 1.5,
+        2: 3.3,
+        3: 5.4,
+        4: 7.9,
+        5: 10.7,
+        6: 13.8,
+        7: 17.1,
+        8: 20.7,
+        9: 24.4,
+        10: 28.4,
+        11: 32.6,
+        12: 36.9,
+    }
+    levels = [int(item) for item in re.findall(r"\d+", wind_power_text)]
+    if not levels:
+        return 0.0
+    if len(levels) >= 2:
+        level = int(round((levels[0] + levels[1]) / 2))
+    else:
+        level = levels[0]
+    level = max(0, min(level, 12))
+    return beaufort_to_mps[level]
+
+
+def _resolve_admin_by_location(longitude: float, latitude: float) -> tuple[str, str, str, str]:
+    reverse_body = _amap_get(
+        "/v3/geocode/regeo",
+        {
+            "key": YourWebServiceKey,
+            "location": f"{longitude},{latitude}",
+            "extensions": "base",
+        },
+    )
+    if reverse_body.get("status") != "1":
+        raise AppError(code=ErrorCode.HTTP, message=reverse_body.get("info", "逆地理解析失败"), http_status=502)
+    address_component = (reverse_body.get("regeocode") or {}).get("addressComponent") or {}
+    adcode = str(address_component.get("adcode") or "").strip()
+    if not adcode:
+        raise AppError(code=ErrorCode.HTTP, message="未获取到城市编码 adcode", http_status=502)
+    province = str(address_component.get("province") or "").strip() or "未知省份"
+    city_raw = address_component.get("city")
+    city = str(city_raw or "").strip() if not isinstance(city_raw, list) else ""
+    if not city:
+        city = province
+    district = str(address_component.get("district") or "").strip() or "未知区县"
+    return province, city, district, adcode
 
 
 def create_app() -> FastAPI:
@@ -504,6 +592,90 @@ def create_app() -> FastAPI:
                 address=str(first.get("address") or "地址未知").strip(),
                 longitude=poi_longitude,
                 latitude=poi_latitude,
+            )
+        )
+
+    @app.get("/weather/by-location", response_model=ApiResponse[WeatherByLocationData])
+    def weather_by_location(longitude: float, latitude: float) -> ApiResponse[WeatherByLocationData]:
+        _ensure_map_config_ready()
+        if longitude < -180 or longitude > 180 or latitude < -90 or latitude > 90:
+            raise AppError(code=ErrorCode.VALIDATION, message="经纬度范围非法", http_status=422)
+
+        province, city, district, adcode = _resolve_admin_by_location(longitude, latitude)
+
+        live_body = _amap_get(
+            "/v3/weather/weatherInfo",
+            {
+                "key": YourWebServiceKey,
+                "city": adcode,
+                "extensions": "base",
+            },
+        )
+        if live_body.get("status") != "1":
+            raise AppError(code=ErrorCode.HTTP, message=live_body.get("info", "实时天气查询失败"), http_status=502)
+        lives = live_body.get("lives") or []
+        if not lives:
+            raise AppError(code=ErrorCode.HTTP, message="未获取到实时天气信息", http_status=502)
+        live = lives[0] or {}
+
+        forecast_body = _amap_get(
+            "/v3/weather/weatherInfo",
+            {
+                "key": YourWebServiceKey,
+                "city": adcode,
+                "extensions": "all",
+            },
+        )
+        if forecast_body.get("status") != "1":
+            raise AppError(code=ErrorCode.HTTP, message=forecast_body.get("info", "天气预报查询失败"), http_status=502)
+        forecasts = forecast_body.get("forecasts") or []
+        casts = (forecasts[0] or {}).get("casts") if forecasts else []
+        cast_rows = casts or []
+
+        current = WeatherCurrentData(
+            province=province,
+            city=city,
+            district=district,
+            adcode=adcode,
+            weather=str(live.get("weather") or "未知").strip(),
+            temperature_c=_parse_float(live.get("temperature"), 0.0),
+            wind_direction=str(live.get("winddirection") or "未知").strip(),
+            wind_speed_mps=_wind_power_to_mps(str(live.get("windpower") or "")),
+            report_time=str(live.get("reporttime") or "").strip(),
+        )
+
+        forecast: list[WeatherForecastDayData] = []
+        for cast in cast_rows:
+            row = cast or {}
+            day_weather = str(row.get("dayweather") or "").strip()
+            night_weather = str(row.get("nightweather") or "").strip()
+            weather = day_weather or night_weather or "未知"
+            day_temp = _parse_float(row.get("daytemp"), 0.0)
+            night_temp = _parse_float(row.get("nighttemp"), 0.0)
+            high_temp = max(day_temp, night_temp)
+            low_temp = min(day_temp, night_temp)
+            date_text = str(row.get("date") or "").strip()
+            try:
+                date.fromisoformat(date_text)
+            except ValueError:
+                continue
+            forecast.append(
+                WeatherForecastDayData(
+                    date=date_text,
+                    weather=weather,
+                    high_temp_c=high_temp,
+                    low_temp_c=low_temp,
+                )
+            )
+
+        return ok(
+            WeatherByLocationData(
+                province=province,
+                city=city,
+                district=district,
+                adcode=adcode,
+                current=current,
+                forecast=forecast,
             )
         )
 

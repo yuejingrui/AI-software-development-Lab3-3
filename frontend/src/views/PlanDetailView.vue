@@ -2,6 +2,7 @@
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import PlanForm from "../components/PlanForm.vue";
+import WeatherSidebar from "../components/WeatherSidebar.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
@@ -360,6 +361,17 @@ async function loadPlaces(): Promise<void> {
     ]);
     planPlaces.value = inPlan;
     allPlaces.value = all;
+    if (inPlan.length > 0 && !placeDraft.name.trim() && !placeDraft.address.trim()) {
+      setPlaceDraft(
+        {
+          name: inPlan[0].name,
+          address: inPlan[0].address,
+          longitude: inPlan[0].longitude,
+          latitude: inPlan[0].latitude,
+        },
+        false
+      );
+    }
     renderAllPlaceMarkers();
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "加载地点失败";
@@ -488,151 +500,177 @@ onBeforeUnmount(() => {
     </section>
 
     <template v-else>
-      <section class="card">
-        <div class="meta">
-          <span v-if="planId !== null">规划 ID：{{ planId }}</span>
-          <span>创建时间：{{ createdAt || "-" }}</span>
-          <span>更新时间：{{ updatedAt || "-" }}</span>
-        </div>
-
-        <PlanForm
-          :model-value="draft"
-          :saving="saving"
-          :show-reset="true"
-          :field-errors="fieldErrors"
-          submit-text="保存修改"
-          @update:model-value="Object.assign(draft, $event)"
-          @submit="submit"
-          @reset="reset"
-        />
-
-        <p v-if="saveTip" class="tip">{{ saveTip }}</p>
-        <p v-if="submitError" class="error">{{ submitError }}</p>
-      </section>
-
-      <section class="card map-card">
-        <div class="section-title-row">
-          <h2>地点管理</h2>
-          <div class="section-actions">
-            <button type="button" class="btn" :disabled="planPlaces.length === 0" @click="showPlanPlacesOnMap">
-              显示当前规划全部地点
-            </button>
-            <button type="button" class="btn" :disabled="allPlaces.length === 0" @click="showAllPlacesOnMap">
-              显示任意规划全部地点
-            </button>
-          </div>
-        </div>
-
-        <p v-if="mapError" class="error">{{ mapError }}</p>
-        <div :id="mapContainerId" class="map"></div>
-
-        <div class="search">
-          <input
-            v-model.trim="searchKeyword"
-            type="text"
-            placeholder="搜索地点关键词，如：上海博物馆"
-            :disabled="searchLoading"
+      <div class="page-grid">
+        <div class="weather-column">
+          <WeatherSidebar
+            :longitude="placeDraft.longitude"
+            :latitude="placeDraft.latitude"
+            :place-name="placeDraft.name || placeDraft.address || '未命名地点'"
+            :plan-date="draft.date"
           />
-          <button type="button" class="btn primary" :disabled="searchLoading" @click="searchAndPick">
-            {{ searchLoading ? "搜索中..." : "搜索并自动选中" }}
-          </button>
-        </div>
-        <p v-if="searchError" class="error">{{ searchError }}</p>
-        <div v-if="searchResults.length > 0" class="search-results">
-          <button
-            v-for="candidate in searchResults"
-            :key="`${candidate.longitude},${candidate.latitude},${candidate.name}`"
-            type="button"
-            class="result-item"
-            @click="setPlaceDraft(candidate)"
-          >
-            <strong>{{ candidate.name }}</strong>
-            <span>{{ candidate.address }}</span>
-          </button>
         </div>
 
-        <form class="place-form" @submit.prevent="submitPlace">
-          <div class="grid">
-            <label>
-              地点名称
-              <input v-model.trim="placeDraft.name" type="text" maxlength="80" :disabled="placeSaving" />
-              <span v-if="placeErrors.name" class="field-error">{{ placeErrors.name }}</span>
-            </label>
-            <label>
-              地点地址
-              <input v-model.trim="placeDraft.address" type="text" maxlength="200" :disabled="placeSaving" />
-              <span v-if="placeErrors.address" class="field-error">{{ placeErrors.address }}</span>
-            </label>
-          </div>
+        <div class="content-column">
+          <section class="card">
+            <div class="meta">
+              <span v-if="planId !== null">规划 ID：{{ planId }}</span>
+              <span>创建时间：{{ createdAt || "-" }}</span>
+              <span>更新时间：{{ updatedAt || "-" }}</span>
+            </div>
 
-          <div class="actions">
-            <button type="submit" class="btn primary" :disabled="placeSaving || !mapReady">
-              {{
-                placeSaving
-                  ? "保存中..."
-                  : editingPlaceId === null
-                    ? "加入当前规划"
-                    : `保存地点 #${editingPlaceId} 修改`
-              }}
-            </button>
-            <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm">取消编辑</button>
-            <button type="button" class="btn" :disabled="placeSaving" @click="centerToPlace(placeDraft)">
-              在地图中显示选中地点
-            </button>
-          </div>
-        </form>
+            <PlanForm
+              :model-value="draft"
+              :saving="saving"
+              :show-reset="true"
+              :field-errors="fieldErrors"
+              submit-text="保存修改"
+              @update:model-value="Object.assign(draft, $event)"
+              @submit="submit"
+              @reset="reset"
+            />
 
-        <p v-if="placeLoading" class="muted">地点列表加载中...</p>
-        <p v-if="placeError" class="error">{{ placeError }}</p>
-        <p v-if="placeTip" class="tip">{{ placeTip }}</p>
-
-        <div class="lists">
-          <section class="sub-card">
-            <h3>当前规划地点（{{ planPlaces.length }}）</h3>
-            <p v-if="planPlaces.length === 0" class="muted">当前规划还没有地点，可在地图点击或搜索后加入。</p>
-            <ul v-else class="place-list">
-              <li v-for="place in planPlaces" :key="place.id" class="place-item">
-                <button type="button" class="place-main" @click="locatePlace(place)">
-                  <strong>{{ place.name }}</strong>
-                  <span>{{ place.address }}</span>
-                </button>
-                <div class="item-actions">
-                  <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
-                  <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
-                  <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
-                </div>
-              </li>
-            </ul>
+            <p v-if="saveTip" class="tip">{{ saveTip }}</p>
+            <p v-if="submitError" class="error">{{ submitError }}</p>
           </section>
 
-          <section class="sub-card">
-            <h3>任意规划地点（{{ allPlaces.length }}）</h3>
-            <p v-if="allPlaces.length === 0" class="muted">暂无地点。</p>
-            <ul v-else class="place-list">
-              <li v-for="place in allPlaces" :key="`all-${place.id}`" class="place-item">
-                <button type="button" class="place-main" @click="locatePlace(place)">
-                  <strong>{{ place.plan_title || "未知规划" }} / {{ place.name }}</strong>
-                  <span>{{ place.address }}</span>
+          <section class="card map-card">
+            <div class="section-title-row">
+              <h2>地点管理</h2>
+              <div class="section-actions">
+                <button type="button" class="btn" :disabled="planPlaces.length === 0" @click="showPlanPlacesOnMap">
+                  显示当前规划全部地点
                 </button>
-                <div class="item-actions">
-                  <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
-                  <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
-                  <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
-                </div>
-              </li>
-            </ul>
+                <button type="button" class="btn" :disabled="allPlaces.length === 0" @click="showAllPlacesOnMap">
+                  显示任意规划全部地点
+                </button>
+              </div>
+            </div>
+
+            <p v-if="mapError" class="error">{{ mapError }}</p>
+            <div :id="mapContainerId" class="map"></div>
+
+            <div class="search">
+              <input
+                v-model.trim="searchKeyword"
+                type="text"
+                placeholder="搜索地点关键词，如：上海博物馆"
+                :disabled="searchLoading"
+              />
+              <button type="button" class="btn primary" :disabled="searchLoading" @click="searchAndPick">
+                {{ searchLoading ? "搜索中..." : "搜索并自动选中" }}
+              </button>
+            </div>
+            <p v-if="searchError" class="error">{{ searchError }}</p>
+            <div v-if="searchResults.length > 0" class="search-results">
+              <button
+                v-for="candidate in searchResults"
+                :key="`${candidate.longitude},${candidate.latitude},${candidate.name}`"
+                type="button"
+                class="result-item"
+                @click="setPlaceDraft(candidate)"
+              >
+                <strong>{{ candidate.name }}</strong>
+                <span>{{ candidate.address }}</span>
+              </button>
+            </div>
+
+            <form class="place-form" @submit.prevent="submitPlace">
+              <div class="grid">
+                <label>
+                  地点名称
+                  <input v-model.trim="placeDraft.name" type="text" maxlength="80" :disabled="placeSaving" />
+                  <span v-if="placeErrors.name" class="field-error">{{ placeErrors.name }}</span>
+                </label>
+                <label>
+                  地点地址
+                  <input v-model.trim="placeDraft.address" type="text" maxlength="200" :disabled="placeSaving" />
+                  <span v-if="placeErrors.address" class="field-error">{{ placeErrors.address }}</span>
+                </label>
+              </div>
+
+              <div class="actions">
+                <button type="submit" class="btn primary" :disabled="placeSaving || !mapReady">
+                  {{
+                    placeSaving
+                      ? "保存中..."
+                      : editingPlaceId === null
+                        ? "加入当前规划"
+                        : `保存地点 #${editingPlaceId} 修改`
+                  }}
+                </button>
+                <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm">取消编辑</button>
+                <button type="button" class="btn" :disabled="placeSaving" @click="centerToPlace(placeDraft)">
+                  在地图中显示选中地点
+                </button>
+              </div>
+            </form>
+
+            <p v-if="placeLoading" class="muted">地点列表加载中...</p>
+            <p v-if="placeError" class="error">{{ placeError }}</p>
+            <p v-if="placeTip" class="tip">{{ placeTip }}</p>
+
+            <div class="lists">
+              <section class="sub-card">
+                <h3>当前规划地点（{{ planPlaces.length }}）</h3>
+                <p v-if="planPlaces.length === 0" class="muted">当前规划还没有地点，可在地图点击或搜索后加入。</p>
+                <ul v-else class="place-list">
+                  <li v-for="place in planPlaces" :key="place.id" class="place-item">
+                    <button type="button" class="place-main" @click="locatePlace(place)">
+                      <strong>{{ place.name }}</strong>
+                      <span>{{ place.address }}</span>
+                    </button>
+                    <div class="item-actions">
+                      <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
+                      <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
+                      <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
+                    </div>
+                  </li>
+                </ul>
+              </section>
+
+              <section class="sub-card">
+                <h3>任意规划地点（{{ allPlaces.length }}）</h3>
+                <p v-if="allPlaces.length === 0" class="muted">暂无地点。</p>
+                <ul v-else class="place-list">
+                  <li v-for="place in allPlaces" :key="`all-${place.id}`" class="place-item">
+                    <button type="button" class="place-main" @click="locatePlace(place)">
+                      <strong>{{ place.plan_title || "未知规划" }} / {{ place.name }}</strong>
+                      <span>{{ place.address }}</span>
+                    </button>
+                    <div class="item-actions">
+                      <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
+                      <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
+                      <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
+                    </div>
+                  </li>
+                </ul>
+              </section>
+            </div>
           </section>
         </div>
-      </section>
+      </div>
     </template>
   </main>
 </template>
 
 <style scoped>
 .container {
-  max-width: 1080px;
+  max-width: 1320px;
   margin: 32px auto;
   padding: 0 16px 24px;
+}
+.page-grid {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.weather-column {
+  position: sticky;
+  top: 12px;
+}
+.content-column {
+  min-width: 0;
 }
 .header {
   display: flex;
@@ -825,5 +863,13 @@ h3 {
 .field-error {
   color: #b91c1c;
   font-size: 12px;
+}
+@media (max-width: 1080px) {
+  .page-grid {
+    grid-template-columns: 1fr;
+  }
+  .weather-column {
+    position: static;
+  }
 }
 </style>
