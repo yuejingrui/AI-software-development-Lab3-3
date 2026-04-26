@@ -6,6 +6,7 @@ import WeatherSidebar from "../components/WeatherSidebar.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
+import type { ItinerarySlot, ItineraryUpdatePayload } from "../types/itinerary";
 import type { Place, PlacePayload } from "../types/place";
 import type { Plan, PlanPayload } from "../types/plan";
 
@@ -68,6 +69,285 @@ let lastHotspotClickAt = 0;
 
 const planPlaces = ref<Place[]>([]);
 const allPlaces = ref<Place[]>([]);
+const mapScopeSelection = ref<"plan" | "all" | null>(null);
+const itineraryLoading = ref(false);
+const itinerarySaving = ref(false);
+const itineraryError = ref<string | null>(null);
+const itineraryTip = ref<string | null>(null);
+const useCustomSlots = ref(false);
+const itinerarySlotPicker = reactive<Record<string, number | null>>({});
+let itinerarySlotIdSeed = 0;
+
+type ItineraryDraftSlot = {
+  uid: string;
+  id?: number;
+  label: string;
+  startMinute: number | null;
+  endMinute: number | null;
+  note: string;
+  placeIds: number[];
+  noteExpanded: boolean;
+};
+
+const itinerarySlots = ref<ItineraryDraftSlot[]>([]);
+
+function newSlotUid(): string {
+  itinerarySlotIdSeed += 1;
+  return `slot-${Date.now()}-${itinerarySlotIdSeed}`;
+}
+
+function createDefaultSlots(): ItineraryDraftSlot[] {
+  return ["上午", "下午", "晚上"].map((label) => ({
+    uid: newSlotUid(),
+    label,
+    startMinute: null,
+    endMinute: null,
+    note: "",
+    placeIds: [],
+    noteExpanded: false,
+  }));
+}
+
+function minuteToTimeText(minute: number | null): string {
+  if (minute === null) return "";
+  const safe = Math.max(0, Math.min(minute, 1440));
+  const hour = Math.floor(safe / 60);
+  const min = safe % 60;
+  return `${String(hour).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
+function timeTextToMinute(text: string): number | null {
+  const normalized = text.trim();
+  if (!normalized) return null;
+  const parts = normalized.split(":");
+  if (parts.length !== 2) return null;
+  const hour = Number(parts[0]);
+  const minute = Number(parts[1]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null;
+  if (hour < 0 || hour > 24 || minute < 0 || minute > 59) return null;
+  if (hour === 24 && minute !== 0) return null;
+  return hour * 60 + minute;
+}
+
+function slotTimeDisplay(slot: ItineraryDraftSlot): string {
+  if (slot.startMinute === null || slot.endMinute === null) return slot.label;
+  return `${minuteToTimeText(slot.startMinute)}-${minuteToTimeText(slot.endMinute)} ${slot.label}`;
+}
+
+function initItineraryDraft(slots: ItinerarySlot[]): void {
+  if (slots.length === 0) {
+    useCustomSlots.value = false;
+    itinerarySlots.value = createDefaultSlots();
+    return;
+  }
+  useCustomSlots.value = slots.every((slot) => slot.start_minute !== null && slot.end_minute !== null);
+  itinerarySlots.value = slots.map((slot) => ({
+    uid: newSlotUid(),
+    id: slot.id,
+    label: slot.label,
+    startMinute: slot.start_minute,
+    endMinute: slot.end_minute,
+    note: slot.note,
+    placeIds: slot.places.map((item) => item.place_id),
+    noteExpanded: false,
+  }));
+  if (!useCustomSlots.value && itinerarySlots.value.length === 0) {
+    itinerarySlots.value = createDefaultSlots();
+  }
+}
+
+async function loadItinerary(): Promise<void> {
+  if (planId.value === null) return;
+  itineraryLoading.value = true;
+  itineraryError.value = null;
+  try {
+    const data = await apiGet<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`);
+    initItineraryDraft(data);
+  } catch (e) {
+    itineraryError.value = e instanceof Error ? e.message : "加载时段行程失败";
+  } finally {
+    itineraryLoading.value = false;
+  }
+}
+
+function validateItineraryDraft(): string | null {
+  if (itinerarySlots.value.length === 0) {
+    return "请至少保留一个时段";
+  }
+  if (useCustomSlots.value) {
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let i = 0; i < itinerarySlots.value.length; i += 1) {
+      const slot = itinerarySlots.value[i];
+      if (!slot.label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
+      if (slot.startMinute === null || slot.endMinute === null) return "自定义时段必须填写开始与结束时间";
+      if (slot.startMinute < 0 || slot.endMinute > 1440 || slot.startMinute >= slot.endMinute) {
+        return `第 ${i + 1} 个时段时间非法`;
+      }
+      ranges.push({ start: slot.startMinute, end: slot.endMinute });
+    }
+    ranges.sort((a, b) => a.start - b.start);
+    for (let i = 1; i < ranges.length; i += 1) {
+      if (ranges[i].start < ranges[i - 1].end) return "自定义时段之间不能重叠";
+    }
+    return null;
+  }
+  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
+    if (!itinerarySlots.value[i].label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
+  }
+  return null;
+}
+
+async function saveItinerary(): Promise<void> {
+  if (planId.value === null) {
+    itineraryError.value = "规划 ID 不存在";
+    return;
+  }
+  itineraryError.value = null;
+  itineraryTip.value = null;
+  const validationError = validateItineraryDraft();
+  if (validationError) {
+    itineraryError.value = validationError;
+    return;
+  }
+  itinerarySaving.value = true;
+  try {
+    const slotsToSave = [...itinerarySlots.value];
+    if (useCustomSlots.value) {
+      slotsToSave.sort((a, b) => (a.startMinute ?? 0) - (b.startMinute ?? 0));
+    }
+    const payload: ItineraryUpdatePayload = {
+      slots: slotsToSave.map((slot, index) => ({
+        id: slot.id,
+        label: slot.label.trim(),
+        start_minute: useCustomSlots.value ? slot.startMinute : null,
+        end_minute: useCustomSlots.value ? slot.endMinute : null,
+        sort_index: index,
+        note: slot.note.trim(),
+        place_ids: [...slot.placeIds],
+      })),
+    };
+    const saved = await apiPut<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`, payload);
+    initItineraryDraft(saved);
+    itineraryTip.value = "时段行程已保存";
+  } catch (e) {
+    itineraryError.value = e instanceof Error ? e.message : "保存时段行程失败";
+  } finally {
+    itinerarySaving.value = false;
+  }
+}
+
+function setSlotMode(custom: boolean): void {
+  if (useCustomSlots.value === custom) return;
+  useCustomSlots.value = custom;
+  itineraryError.value = null;
+  itineraryTip.value = null;
+  if (!custom && itinerarySlots.value.length === 0) {
+    itinerarySlots.value = createDefaultSlots();
+  }
+  if (!custom) {
+    for (const slot of itinerarySlots.value) {
+      slot.startMinute = null;
+      slot.endMinute = null;
+    }
+    return;
+  }
+  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
+    const slot = itinerarySlots.value[i];
+    if (slot.startMinute !== null && slot.endMinute !== null) continue;
+    if (i === 0) {
+      slot.startMinute = 8 * 60;
+      slot.endMinute = 12 * 60;
+    } else if (i === 1) {
+      slot.startMinute = 13 * 60;
+      slot.endMinute = 17 * 60;
+    } else {
+      slot.startMinute = 18 * 60;
+      slot.endMinute = 21 * 60;
+    }
+  }
+}
+
+function addCustomSlot(): void {
+  itinerarySlots.value.push({
+    uid: newSlotUid(),
+    label: `时段 ${itinerarySlots.value.length + 1}`,
+    startMinute: null,
+    endMinute: null,
+    note: "",
+    placeIds: [],
+    noteExpanded: true,
+  });
+}
+
+function removeCustomSlot(uid: string): void {
+  itinerarySlots.value = itinerarySlots.value.filter((slot) => slot.uid !== uid);
+}
+
+function moveSlot(uid: string, direction: -1 | 1): void {
+  const index = itinerarySlots.value.findIndex((slot) => slot.uid === uid);
+  if (index < 0) return;
+  const target = index + direction;
+  if (target < 0 || target >= itinerarySlots.value.length) return;
+  const next = [...itinerarySlots.value];
+  const [current] = next.splice(index, 1);
+  next.splice(target, 0, current);
+  itinerarySlots.value = next;
+}
+
+function findPlaceInPlan(placeId: number): Place | null {
+  return planPlaces.value.find((place) => place.id === placeId) || null;
+}
+
+function addPlaceToSlot(slotUid: string, placeId: number): void {
+  const slot = itinerarySlots.value.find((item) => item.uid === slotUid);
+  if (!slot) return;
+  if (slot.placeIds.includes(placeId)) return;
+  slot.placeIds.push(placeId);
+}
+
+function removePlaceFromSlot(slotUid: string, placeId: number): void {
+  const slot = itinerarySlots.value.find((item) => item.uid === slotUid);
+  if (!slot) return;
+  slot.placeIds = slot.placeIds.filter((id) => id !== placeId);
+}
+
+function focusSlotOnMap(slot: ItineraryDraftSlot): void {
+  if (!mapInstance || slot.placeIds.length === 0) return;
+  const overlays = slot.placeIds
+    .map((placeId) => placeMarkerMap.get(placeId))
+    .filter((v): v is AMapMarkerLike => Boolean(v));
+  if (overlays.length > 0) {
+    mapInstance.setFitView(overlays);
+    ensureMapCenteredInViewport();
+  }
+}
+
+async function assignCurrentPickToSlot(slotUid: string): Promise<void> {
+  if (planId.value === null) return;
+  itineraryError.value = null;
+  const payload: PlacePayload = { ...placeDraft };
+  if (!validatePlace(payload)) {
+    itineraryError.value = "当前选中地点信息不完整，无法分配到时段";
+    return;
+  }
+  let place = planPlaces.value.find(
+    (item) =>
+      item.name === payload.name &&
+      item.address === payload.address &&
+      Math.abs(item.longitude - payload.longitude) < 0.000001 &&
+      Math.abs(item.latitude - payload.latitude) < 0.000001
+  );
+  try {
+    if (!place) {
+      place = await apiPost<Place>(`/plans/${planId.value}/places`, payload);
+      await loadPlaces();
+    }
+    addPlaceToSlot(slotUid, place.id);
+    itineraryTip.value = "已将当前选中地点分配到时段";
+  } catch (e) {
+    itineraryError.value = e instanceof Error ? e.message : "分配当前地点失败";
+  }
+}
 
 function toPayload(plan: Plan): PlanPayload {
   return {
@@ -361,6 +641,10 @@ async function loadPlaces(): Promise<void> {
     ]);
     planPlaces.value = inPlan;
     allPlaces.value = all;
+    const validIds = new Set(inPlan.map((item) => item.id));
+    for (const slot of itinerarySlots.value) {
+      slot.placeIds = slot.placeIds.filter((placeId) => validIds.has(placeId));
+    }
     if (inPlan.length > 0 && !placeDraft.name.trim() && !placeDraft.address.trim()) {
       setPlaceDraft(
         {
@@ -416,6 +700,7 @@ async function removePlace(placeId: number): Promise<void> {
       resetPlaceForm();
     }
     await loadPlaces();
+    await loadItinerary();
     placeTip.value = "地点已删除";
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "删除地点失败";
@@ -449,6 +734,7 @@ async function searchAndPick(): Promise<void> {
 
 function showPlanPlacesOnMap(): void {
   if (!mapInstance || planPlaces.value.length === 0) return;
+  applyMapScopeSelection("plan");
   const overlays = planPlaces.value
     .map((place) => placeMarkerMap.get(place.id))
     .filter((v): v is AMapMarkerLike => Boolean(v));
@@ -457,7 +743,39 @@ function showPlanPlacesOnMap(): void {
 
 function showAllPlacesOnMap(): void {
   if (!mapInstance || placeMarkerMap.size === 0) return;
+  applyMapScopeSelection("all");
   mapInstance.setFitView([...placeMarkerMap.values()]);
+}
+
+function clearMapScopeSelection(): void {
+  applyMapScopeSelection(null);
+}
+
+function applyMapScopeSelection(scope: "plan" | "all" | null): void {
+  mapScopeSelection.value = scope;
+  if (!mapInstance) return;
+  if (placeMarkerMap.size > 0) {
+    mapInstance.remove([...placeMarkerMap.values()]);
+  }
+  if (scope === "all") {
+    mapInstance.add([...placeMarkerMap.values()]);
+    return;
+  }
+  if (scope === "plan") {
+    const planMarkers = planPlaces.value
+      .map((place) => placeMarkerMap.get(place.id))
+      .filter((v): v is AMapMarkerLike => Boolean(v));
+    if (planMarkers.length > 0) {
+      mapInstance.add(planMarkers);
+    }
+  }
+}
+
+function onDocumentClickForMapScope(event: MouseEvent): void {
+  if (mapScopeSelection.value === null) return;
+  const target = event.target as HTMLElement | null;
+  if (target?.closest("[data-map-scope-button='true']")) return;
+  clearMapScopeSelection();
 }
 
 function locatePlace(place: Place): void {
@@ -475,6 +793,8 @@ onMounted(async () => {
   await nextTick();
   await initMap();
   await loadPlaces();
+  await loadItinerary();
+  document.addEventListener("click", onDocumentClickForMapScope, true);
 });
 
 onBeforeUnmount(() => {
@@ -482,6 +802,7 @@ onBeforeUnmount(() => {
     mapInstance.destroy();
     mapInstance = null;
   }
+  document.removeEventListener("click", onDocumentClickForMapScope, true);
 });
 </script>
 
@@ -537,10 +858,24 @@ onBeforeUnmount(() => {
             <div class="section-title-row">
               <h2>地点管理</h2>
               <div class="section-actions">
-                <button type="button" class="btn" :disabled="planPlaces.length === 0" @click="showPlanPlacesOnMap">
+                <button
+                  type="button"
+                  class="btn"
+                  :class="{ active: mapScopeSelection === 'plan' }"
+                  data-map-scope-button="true"
+                  :disabled="planPlaces.length === 0"
+                  @click="showPlanPlacesOnMap"
+                >
                   显示当前规划全部地点
                 </button>
-                <button type="button" class="btn" :disabled="allPlaces.length === 0" @click="showAllPlacesOnMap">
+                <button
+                  type="button"
+                  class="btn"
+                  :class="{ active: mapScopeSelection === 'all' }"
+                  data-map-scope-button="true"
+                  :disabled="allPlaces.length === 0"
+                  @click="showAllPlacesOnMap"
+                >
                   显示任意规划全部地点
                 </button>
               </div>
@@ -608,6 +943,135 @@ onBeforeUnmount(() => {
             <p v-if="placeLoading" class="muted">地点列表加载中...</p>
             <p v-if="placeError" class="error">{{ placeError }}</p>
             <p v-if="placeTip" class="tip">{{ placeTip }}</p>
+
+            <section class="sub-card itinerary-card">
+              <div class="section-title-row">
+                <h3>时段行程</h3>
+                <div class="section-actions">
+                  <button type="button" class="btn small" :class="{ active: !useCustomSlots }" @click="setSlotMode(false)">
+                    上午/下午/晚上
+                  </button>
+                  <button type="button" class="btn small" :class="{ active: useCustomSlots }" @click="setSlotMode(true)">
+                    自定义时段
+                  </button>
+                  <button v-if="useCustomSlots" type="button" class="btn small" @click="addCustomSlot">新增时段</button>
+                  <button type="button" class="btn small primary" :disabled="itinerarySaving" @click="saveItinerary">
+                    {{ itinerarySaving ? "保存中..." : "保存时段行程" }}
+                  </button>
+                </div>
+              </div>
+              <p v-if="itineraryLoading" class="muted">时段行程加载中...</p>
+              <p v-if="itineraryError" class="error">{{ itineraryError }}</p>
+              <p v-if="itineraryTip" class="tip">{{ itineraryTip }}</p>
+              <p v-if="itinerarySlots.length === 0" class="muted">暂无时段，请新增后保存。</p>
+              <ul v-else class="itinerary-list">
+                <li v-for="(slot, index) in itinerarySlots" :key="slot.uid" class="itinerary-item">
+                  <div class="itinerary-head">
+                    <button type="button" class="itinerary-main" @click="focusSlotOnMap(slot)">
+                      <strong>{{ slotTimeDisplay(slot) }}</strong>
+                      <span>地点 {{ slot.placeIds.length }} 个（点击聚焦地图）</span>
+                    </button>
+                    <div class="item-actions">
+                      <button
+                        v-if="!useCustomSlots"
+                        type="button"
+                        class="btn small"
+                        :disabled="index === 0"
+                        @click="moveSlot(slot.uid, -1)"
+                      >
+                        上移
+                      </button>
+                      <button
+                        v-if="!useCustomSlots"
+                        type="button"
+                        class="btn small"
+                        :disabled="index === itinerarySlots.length - 1"
+                        @click="moveSlot(slot.uid, 1)"
+                      >
+                        下移
+                      </button>
+                      <button
+                        v-if="useCustomSlots"
+                        type="button"
+                        class="btn small danger"
+                        :disabled="itinerarySlots.length <= 1"
+                        @click="removeCustomSlot(slot.uid)"
+                      >
+                        删除时段
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="itinerary-editor">
+                    <div class="grid">
+                      <label>
+                        时段名称
+                        <input v-model.trim="slot.label" type="text" maxlength="30" :disabled="itinerarySaving" />
+                      </label>
+                      <label v-if="useCustomSlots">
+                        开始时间
+                        <input
+                          :value="minuteToTimeText(slot.startMinute)"
+                          type="time"
+                          :disabled="itinerarySaving"
+                          @input="slot.startMinute = timeTextToMinute(String(($event.target as HTMLInputElement).value))"
+                        />
+                      </label>
+                      <label v-if="useCustomSlots">
+                        结束时间
+                        <input
+                          :value="minuteToTimeText(slot.endMinute)"
+                          type="time"
+                          :disabled="itinerarySaving"
+                          @input="slot.endMinute = timeTextToMinute(String(($event.target as HTMLInputElement).value))"
+                        />
+                      </label>
+                    </div>
+
+                    <div class="assign-row">
+                      <select v-model="itinerarySlotPicker[slot.uid]" :disabled="planPlaces.length === 0">
+                        <option :value="null">从当前规划地点选择</option>
+                        <option v-for="place in planPlaces" :key="`picker-${slot.uid}-${place.id}`" :value="place.id">
+                          {{ place.name }}
+                        </option>
+                      </select>
+                      <button
+                        type="button"
+                        class="btn small"
+                        :disabled="itinerarySlotPicker[slot.uid] === null || itinerarySlotPicker[slot.uid] === undefined"
+                        @click="addPlaceToSlot(slot.uid, Number(itinerarySlotPicker[slot.uid]))"
+                      >
+                        分配已选地点
+                      </button>
+                      <button type="button" class="btn small" @click="assignCurrentPickToSlot(slot.uid)">
+                        分配当前地图选中地点
+                      </button>
+                    </div>
+
+                    <div v-if="slot.placeIds.length > 0" class="tag-list">
+                      <span v-for="placeId in slot.placeIds" :key="`slot-place-${slot.uid}-${placeId}`" class="tag">
+                        {{ findPlaceInPlan(placeId)?.name || `地点 #${placeId}` }}
+                        <button type="button" class="tag-remove" @click="removePlaceFromSlot(slot.uid, placeId)">x</button>
+                      </span>
+                    </div>
+                    <p v-else class="muted">当前时段未分配地点。</p>
+
+                    <div class="note-block">
+                      <button type="button" class="btn small" @click="slot.noteExpanded = !slot.noteExpanded">
+                        {{ slot.noteExpanded ? "收起备注" : "展开备注" }}
+                      </button>
+                      <textarea
+                        v-if="slot.noteExpanded"
+                        v-model.trim="slot.note"
+                        rows="3"
+                        maxlength="500"
+                        placeholder="输入时段备注，可后续修改或清空"
+                      />
+                    </div>
+                  </div>
+                </li>
+              </ul>
+            </section>
 
             <div class="lists">
               <section class="sub-card">
@@ -863,6 +1327,96 @@ h3 {
 .field-error {
   color: #b91c1c;
   font-size: 12px;
+}
+.btn.active {
+  border-color: #2563eb;
+  color: #1d4ed8;
+}
+.itinerary-card {
+  background: #f8fafc;
+}
+.itinerary-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 10px;
+}
+.itinerary-item {
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+.itinerary-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+.itinerary-main {
+  border: none;
+  background: transparent;
+  text-align: left;
+  display: grid;
+  gap: 4px;
+  cursor: pointer;
+  color: #111827;
+}
+.itinerary-main span {
+  color: #6b7280;
+  font-size: 12px;
+}
+.itinerary-editor {
+  display: grid;
+  gap: 10px;
+}
+.assign-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.assign-row select {
+  min-width: 220px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 6px 8px;
+  font: inherit;
+}
+.tag-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #c7d2fe;
+  border-radius: 999px;
+  background: #eef2ff;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.tag-remove {
+  border: none;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+  padding: 0;
+}
+.note-block {
+  display: grid;
+  gap: 8px;
+}
+.note-block textarea {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 8px;
+  font: inherit;
+  resize: vertical;
 }
 @media (max-width: 1080px) {
   .page-grid {

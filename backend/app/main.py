@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -75,6 +76,41 @@ class PlaceData(BaseModel):
     latitude: float
     created_at: str
     updated_at: str
+
+
+class ItinerarySlotInput(BaseModel):
+    id: int | None = None
+    label: str = Field(min_length=1, max_length=30)
+    start_minute: int | None = Field(default=None, ge=0, le=1440)
+    end_minute: int | None = Field(default=None, ge=0, le=1440)
+    sort_index: int = Field(default=0, ge=0)
+    note: str = Field(default="", max_length=500)
+    place_ids: list[int] = Field(default_factory=list)
+
+
+class ItineraryUpdateInput(BaseModel):
+    slots: list[ItinerarySlotInput] = Field(default_factory=list)
+
+
+class ItinerarySlotPlaceData(BaseModel):
+    slot_place_id: int
+    sort_index: int
+    place_id: int
+    name: str
+    address: str
+    longitude: float
+    latitude: float
+
+
+class ItinerarySlotData(BaseModel):
+    id: int
+    plan_id: int
+    label: str
+    start_minute: int | None
+    end_minute: int | None
+    sort_index: int
+    note: str
+    places: list[ItinerarySlotPlaceData]
 
 
 class MapConfigData(BaseModel):
@@ -186,6 +222,105 @@ def _load_place(place_id: int) -> PlaceData:
 
 def _is_placeholder(value: str) -> bool:
     return value.strip() in {"", "------"}
+
+
+def _validate_itinerary_slots(slots: list[ItinerarySlotInput]) -> None:
+    if not slots:
+        return
+    has_custom_time = any(slot.start_minute is not None or slot.end_minute is not None for slot in slots)
+    if has_custom_time:
+        ranges: list[tuple[int, int]] = []
+        for index, slot in enumerate(slots):
+            if slot.start_minute is None or slot.end_minute is None:
+                raise AppError(
+                    code=ErrorCode.VALIDATION,
+                    message="自定义时段时，所有时段都必须填写开始与结束时间",
+                    http_status=422,
+                )
+            start_minute = slot.start_minute
+            end_minute = slot.end_minute
+            if start_minute < 0 or end_minute > 1440 or start_minute >= end_minute:
+                raise AppError(
+                    code=ErrorCode.VALIDATION,
+                    message=f"时段 {index + 1} 时间范围非法，必须满足 00:00 <= 开始 < 结束 <= 24:00",
+                    http_status=422,
+                )
+            ranges.append((start_minute, end_minute))
+        ranges.sort(key=lambda item: item[0])
+        for i in range(1, len(ranges)):
+            prev_end = ranges[i - 1][1]
+            curr_start = ranges[i][0]
+            if curr_start < prev_end:
+                raise AppError(code=ErrorCode.VALIDATION, message="自定义时段之间不能重叠", http_status=422)
+    for slot in slots:
+        if not slot.label.strip():
+            raise AppError(code=ErrorCode.VALIDATION, message="时段名称不能为空", http_status=422)
+        if len(set(slot.place_ids)) != len(slot.place_ids):
+            raise AppError(code=ErrorCode.VALIDATION, message="同一时段不能重复分配同一地点", http_status=422)
+
+
+def _sort_itinerary_slots(slots: list[ItinerarySlotData]) -> list[ItinerarySlotData]:
+    if slots and all(slot.start_minute is not None and slot.end_minute is not None for slot in slots):
+        return sorted(
+            slots,
+            key=lambda slot: (slot.start_minute or 0, slot.end_minute or 0, slot.sort_index, slot.id),
+        )
+    return sorted(slots, key=lambda slot: (slot.sort_index, slot.id))
+
+
+def _load_plan_itinerary(plan_id: int) -> list[ItinerarySlotData]:
+    with db_conn() as conn:
+        slot_rows = conn.execute(
+            """
+            SELECT *
+            FROM itinerary_slots
+            WHERE plan_id = ?
+            ORDER BY sort_index ASC, id ASC
+            """.strip(),
+            (plan_id,),
+        ).fetchall()
+        if not slot_rows:
+            return []
+        slot_ids = [int(row["id"]) for row in slot_rows]
+        placeholders = ",".join("?" for _ in slot_ids)
+        place_rows = conn.execute(
+            f"""
+            SELECT isp.id AS slot_place_id, isp.slot_id, isp.sort_index, p.*
+            FROM itinerary_slot_places AS isp
+            JOIN places AS p ON p.id = isp.place_id
+            WHERE isp.slot_id IN ({placeholders}) AND p.plan_id = ?
+            ORDER BY isp.sort_index ASC, isp.id ASC
+            """.strip(),
+            (*slot_ids, plan_id),
+        ).fetchall()
+        places_by_slot: dict[int, list[ItinerarySlotPlaceData]] = defaultdict(list)
+        for row in place_rows:
+            slot_id = int(row["slot_id"])
+            places_by_slot[slot_id].append(
+                ItinerarySlotPlaceData(
+                    slot_place_id=int(row["slot_place_id"]),
+                    sort_index=int(row["sort_index"]),
+                    place_id=int(row["id"]),
+                    name=row["name"],
+                    address=row["address"],
+                    longitude=row["longitude"],
+                    latitude=row["latitude"],
+                )
+            )
+        slots = [
+            ItinerarySlotData(
+                id=int(row["id"]),
+                plan_id=int(row["plan_id"]),
+                label=row["label"],
+                start_minute=row["start_minute"],
+                end_minute=row["end_minute"],
+                sort_index=int(row["sort_index"]),
+                note=row["note"],
+                places=places_by_slot.get(int(row["id"]), []),
+            )
+            for row in slot_rows
+        ]
+        return _sort_itinerary_slots(slots)
 
 
 def _ensure_map_config_ready() -> None:
@@ -468,6 +603,73 @@ def create_app() -> FastAPI:
             if cursor.rowcount == 0:
                 raise AppError(code=ErrorCode.NOT_FOUND, message="地点不存在", http_status=404)
             return ok({"deleted": True})
+
+    @app.get("/plans/{plan_id}/itinerary", response_model=ApiResponse[list[ItinerarySlotData]])
+    def get_plan_itinerary(plan_id: int) -> ApiResponse[list[ItinerarySlotData]]:
+        _ensure_plan_exists(plan_id)
+        return ok(_load_plan_itinerary(plan_id))
+
+    @app.put("/plans/{plan_id}/itinerary", response_model=ApiResponse[list[ItinerarySlotData]])
+    def replace_plan_itinerary(plan_id: int, payload: ItineraryUpdateInput) -> ApiResponse[list[ItinerarySlotData]]:
+        _ensure_plan_exists(plan_id)
+        _validate_itinerary_slots(payload.slots)
+        place_ids = sorted({place_id for slot in payload.slots for place_id in slot.place_ids})
+        with db_conn() as conn:
+            if place_ids:
+                placeholders = ",".join("?" for _ in place_ids)
+                rows = conn.execute(
+                    f"""
+                    SELECT id
+                    FROM places
+                    WHERE plan_id = ? AND id IN ({placeholders})
+                    """.strip(),
+                    (plan_id, *place_ids),
+                ).fetchall()
+                existing_place_ids = {int(row["id"]) for row in rows}
+                missing_ids = [str(pid) for pid in place_ids if pid not in existing_place_ids]
+                if missing_ids:
+                    raise AppError(
+                        code=ErrorCode.VALIDATION,
+                        message=f"存在不属于当前规划的地点: {', '.join(missing_ids)}",
+                        http_status=422,
+                    )
+            conn.execute(
+                """
+                DELETE FROM itinerary_slot_places
+                WHERE slot_id IN (SELECT id FROM itinerary_slots WHERE plan_id = ?)
+                """.strip(),
+                (plan_id,),
+            )
+            conn.execute("DELETE FROM itinerary_slots WHERE plan_id = ?", (plan_id,))
+            now = _now_iso()
+            for sort_index, slot in enumerate(payload.slots):
+                slot_cursor = conn.execute(
+                    """
+                    INSERT INTO itinerary_slots (plan_id, label, start_minute, end_minute, sort_index, note, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """.strip(),
+                    (
+                        plan_id,
+                        slot.label.strip(),
+                        slot.start_minute,
+                        slot.end_minute,
+                        sort_index,
+                        slot.note.strip(),
+                        now,
+                        now,
+                    ),
+                )
+                slot_id = int(slot_cursor.lastrowid)
+                for place_sort_index, place_id in enumerate(slot.place_ids):
+                    conn.execute(
+                        """
+                        INSERT INTO itinerary_slot_places (slot_id, place_id, sort_index, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """.strip(),
+                        (slot_id, place_id, place_sort_index, now, now),
+                    )
+            conn.commit()
+        return ok(_load_plan_itinerary(plan_id))
 
     @app.get("/map/config", response_model=ApiResponse[MapConfigData])
     def get_map_config() -> ApiResponse[MapConfigData]:
