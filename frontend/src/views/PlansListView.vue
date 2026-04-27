@@ -8,6 +8,18 @@ const loading = ref(false);
 const errorMessage = ref<string | null>(null);
 const plans = ref<Plan[]>([]);
 
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  const second = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+}
+
 async function loadPlans(): Promise<void> {
   loading.value = true;
   errorMessage.value = null;
@@ -55,7 +67,7 @@ onMounted(() => {
         <div class="meta">日期：{{ plan.date }}</div>
         <div class="meta">预算：{{ plan.budget }} 元</div>
         <div class="meta">人数：{{ plan.people_count }} 人</div>
-        <div class="meta muted">更新时间：{{ plan.updated_at }}</div>
+        <div class="meta muted">更新时间：{{ formatDateTime(plan.updated_at) }}</div>
       </RouterLink>
     </section>
   </main>

@@ -254,7 +254,12 @@ watch(
         还没有聊天记录。可以先问“请帮我检查这份行程是否超预算”。
       </p>
       <ul v-else class="chat-list">
-        <li v-for="(message, index) in activeSession.messages" :key="`${message.createdAt}-${index}`" class="chat-item">
+        <li
+          v-for="(message, index) in activeSession.messages"
+          :key="`${message.createdAt}-${index}`"
+          class="chat-item"
+          :class="message.role === 'user' ? 'chat-user' : 'chat-assistant'"
+        >
           <p class="role" :class="message.role === 'user' ? 'user' : 'assistant'">
             {{ message.role === "user" ? "我" : "AI" }}
           </p>
@@ -365,12 +370,23 @@ h4 {
   gap: 8px;
 }
 .chat-item {
-  border: 1px solid #dbeafe;
-  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
   background: #fff;
   padding: 8px;
   display: grid;
   gap: 4px;
+  max-width: 92%;
+}
+.chat-user {
+  justify-self: end;
+  background: #dbeafe;
+  border-color: #bfdbfe;
+}
+.chat-assistant {
+  justify-self: start;
+  background: #f8fafc;
+  border-color: #cbd5e1;
 }
 .role {
   margin: 0;
@@ -386,6 +402,8 @@ h4 {
 .content {
   margin: 0;
   white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.45;
 }
 .summary {
   display: grid;

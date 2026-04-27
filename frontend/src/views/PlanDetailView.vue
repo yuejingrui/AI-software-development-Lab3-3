@@ -140,6 +140,19 @@ function slotTimeDisplay(slot: ItineraryDraftSlot): string {
   return `${minuteToTimeText(slot.startMinute)}-${minuteToTimeText(slot.endMinute)} ${slot.label}`;
 }
 
+function formatDateTime(value: string): string {
+  if (!value.trim()) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  const second = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+}
+
 function initItineraryDraft(slots: ItinerarySlot[]): void {
   if (slots.length === 0) {
     useCustomSlots.value = false;
@@ -353,6 +366,18 @@ async function assignCurrentPickToSlot(slotUid: string): Promise<void> {
   } catch (e) {
     itineraryError.value = e instanceof Error ? e.message : "分配当前地点失败";
   }
+}
+
+async function assignPlaceToSlot(slotUid: string): Promise<void> {
+  itineraryError.value = null;
+  itineraryTip.value = null;
+  const selectedPlaceId = itinerarySlotPicker[slotUid];
+  if (typeof selectedPlaceId === "number") {
+    addPlaceToSlot(slotUid, selectedPlaceId);
+    itineraryTip.value = "已将已选地点分配到时段";
+    return;
+  }
+  await assignCurrentPickToSlot(slotUid);
 }
 
 function toPayload(plan: Plan): PlanPayload {
@@ -652,17 +677,6 @@ async function loadPlaces(): Promise<void> {
     for (const slot of itinerarySlots.value) {
       slot.placeIds = slot.placeIds.filter((placeId) => validIds.has(placeId));
     }
-    if (inPlan.length > 0 && !placeDraft.name.trim() && !placeDraft.address.trim()) {
-      setPlaceDraft(
-        {
-          name: inPlan[0].name,
-          address: inPlan[0].address,
-          longitude: inPlan[0].longitude,
-          latitude: inPlan[0].latitude,
-        },
-        false
-      );
-    }
     renderAllPlaceMarkers();
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "加载地点失败";
@@ -796,6 +810,11 @@ function locatePlace(place: Place): void {
   }, false);
 }
 
+function showAllHistoryPlacesOnMap(): void {
+  showAllPlacesOnMap();
+  ensureMapCenteredInViewport();
+}
+
 onMounted(async () => {
   await loadPlan();
   if (loadError.value) return;
@@ -839,15 +858,17 @@ onBeforeUnmount(() => {
             :latitude="placeDraft.latitude"
             :place-name="placeDraft.name || placeDraft.address || '未命名地点'"
             :plan-date="draft.date"
+            :all-places-count="allPlaces.length"
+            @request-show-all-places="showAllHistoryPlacesOnMap"
           />
         </div>
 
         <div class="content-column">
-          <section class="card">
+          <section class="card plan-card">
             <div class="meta">
               <span v-if="planId !== null">规划 ID：{{ planId }}</span>
-              <span>创建时间：{{ createdAt || "-" }}</span>
-              <span>更新时间：{{ updatedAt || "-" }}</span>
+              <span>创建时间：{{ formatDateTime(createdAt) }}</span>
+              <span>更新时间：{{ formatDateTime(updatedAt) }}</span>
             </div>
 
             <PlanForm
@@ -878,16 +899,6 @@ onBeforeUnmount(() => {
                   @click="showPlanPlacesOnMap"
                 >
                   显示当前规划全部地点
-                </button>
-                <button
-                  type="button"
-                  class="btn"
-                  :class="{ active: mapScopeSelection === 'all' }"
-                  data-map-scope-button="true"
-                  :disabled="allPlaces.length === 0"
-                  @click="showAllPlacesOnMap"
-                >
-                  显示任意规划全部地点
                 </button>
               </div>
             </div>
@@ -945,9 +956,6 @@ onBeforeUnmount(() => {
                   }}
                 </button>
                 <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm">取消编辑</button>
-                <button type="button" class="btn" :disabled="placeSaving" @click="centerToPlace(placeDraft)">
-                  在地图中显示选中地点
-                </button>
               </div>
             </form>
 
@@ -1041,21 +1049,13 @@ onBeforeUnmount(() => {
 
                     <div class="assign-row">
                       <select v-model="itinerarySlotPicker[slot.uid]" :disabled="planPlaces.length === 0">
-                        <option :value="null">从当前规划地点选择</option>
+                        <option :value="null">使用当前地图选中地点（未加入会自动加入）</option>
                         <option v-for="place in planPlaces" :key="`picker-${slot.uid}-${place.id}`" :value="place.id">
                           {{ place.name }}
                         </option>
                       </select>
-                      <button
-                        type="button"
-                        class="btn small"
-                        :disabled="itinerarySlotPicker[slot.uid] === null || itinerarySlotPicker[slot.uid] === undefined"
-                        @click="addPlaceToSlot(slot.uid, Number(itinerarySlotPicker[slot.uid]))"
-                      >
-                        分配已选地点
-                      </button>
-                      <button type="button" class="btn small" @click="assignCurrentPickToSlot(slot.uid)">
-                        分配当前地图选中地点
+                      <button type="button" class="btn small" @click="assignPlaceToSlot(slot.uid)">
+                        分配地点
                       </button>
                     </div>
 
@@ -1085,31 +1085,13 @@ onBeforeUnmount(() => {
             </section>
 
             <div class="lists">
-              <section class="sub-card">
+              <section class="sub-card plan-places-card">
                 <h3>当前规划地点（{{ planPlaces.length }}）</h3>
                 <p v-if="planPlaces.length === 0" class="muted">当前规划还没有地点，可在地图点击或搜索后加入。</p>
                 <ul v-else class="place-list">
                   <li v-for="place in planPlaces" :key="place.id" class="place-item">
                     <button type="button" class="place-main" @click="locatePlace(place)">
                       <strong>{{ place.name }}</strong>
-                      <span>{{ place.address }}</span>
-                    </button>
-                    <div class="item-actions">
-                      <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
-                      <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
-                      <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
-                    </div>
-                  </li>
-                </ul>
-              </section>
-
-              <section class="sub-card">
-                <h3>任意规划地点（{{ allPlaces.length }}）</h3>
-                <p v-if="allPlaces.length === 0" class="muted">暂无地点。</p>
-                <ul v-else class="place-list">
-                  <li v-for="place in allPlaces" :key="`all-${place.id}`" class="place-item">
-                    <button type="button" class="place-main" @click="locatePlace(place)">
-                      <strong>{{ place.plan_title || "未知规划" }} / {{ place.name }}</strong>
                       <span>{{ place.address }}</span>
                     </button>
                     <div class="item-actions">
@@ -1142,18 +1124,26 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr) 360px;
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
+  height: calc(100vh - 120px);
 }
 .weather-column {
   position: sticky;
   top: 12px;
+  align-self: start;
 }
 .content-column {
   min-width: 0;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 .ai-column {
-  position: sticky;
-  top: 12px;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 .header {
   display: flex;
@@ -1174,12 +1164,16 @@ h3 {
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   padding: 16px;
-  background: #fff;
+  background: #f8fbff;
   margin-bottom: 12px;
+}
+.plan-card {
+  background: #f6faff;
 }
 .map-card {
   display: grid;
   gap: 12px;
+  background: #f3f8ff;
 }
 .meta {
   display: flex;
@@ -1276,6 +1270,10 @@ h3 {
   padding: 10px;
   display: grid;
   gap: 8px;
+  background: #edf5ff;
+}
+.plan-places-card {
+  background: #e8f2ff;
 }
 .place-list {
   margin: 0;
@@ -1440,12 +1438,20 @@ h3 {
 @media (max-width: 1080px) {
   .page-grid {
     grid-template-columns: 1fr;
+    height: auto;
   }
   .weather-column {
     position: static;
   }
+  .content-column {
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
+  }
   .ai-column {
-    position: static;
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
   }
 }
 </style>

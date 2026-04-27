@@ -12,6 +12,10 @@ const props = defineProps<{
   latitude: number;
   placeName: string;
   planDate: string;
+  allPlacesCount: number;
+}>();
+const emit = defineEmits<{
+  requestShowAllPlaces: [];
 }>();
 
 const loading = ref(false);
@@ -234,6 +238,12 @@ watch(
             <p v-if="!riskCheck.weather_risk.has_forecast_for_plan_date" class="status warn">规划日期暂无可用天气预报</p>
           </div>
         </template>
+        <div class="history-places-action">
+          <button type="button" class="btn" :disabled="allPlacesCount === 0" @click="emit('requestShowAllPlaces')">
+            所有历史规划地点
+          </button>
+          <p v-if="allPlacesCount === 0" class="status">暂无可展示的历史地点</p>
+        </div>
       </section>
     </template>
   </aside>
@@ -320,6 +330,11 @@ h3 {
   display: grid;
   gap: 4px;
   background: #f9fafb;
+}
+.history-places-action {
+  display: grid;
+  gap: 6px;
+  padding-top: 4px;
 }
 .risk-title {
   margin: 0;

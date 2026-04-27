@@ -284,7 +284,7 @@ onBeforeUnmount(() => {
   <main class="container">
     <header class="header">
       <h1>新建规划</h1>
-      <RouterLink class="back" to="/plans">返回列表</RouterLink>
+      <RouterLink class="back" to="/plans">查看所有规划</RouterLink>
     </header>
 
     <section class="card">
@@ -344,9 +344,6 @@ onBeforeUnmount(() => {
         <div class="actions">
           <button type="button" class="btn primary" :disabled="saving || !mapReady" @click="addPendingPlace">
             添加到待创建清单
-          </button>
-          <button type="button" class="btn" :disabled="saving || !mapReady" @click="centerToPlace(placeDraft)">
-            在地图中显示选中地点
           </button>
         </div>
       </div>
