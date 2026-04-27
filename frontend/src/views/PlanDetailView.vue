@@ -76,7 +76,6 @@ const itineraryLoading = ref(false);
 const itinerarySaving = ref(false);
 const itineraryError = ref<string | null>(null);
 const itineraryTip = ref<string | null>(null);
-const useCustomSlots = ref(false);
 const itinerarySlotPicker = reactive<Record<string, number | null>>({});
 let itinerarySlotIdSeed = 0;
 
@@ -103,11 +102,11 @@ function newSlotUid(): string {
 }
 
 function createDefaultSlots(): ItineraryDraftSlot[] {
-  return ["上午", "下午", "晚上"].map((label) => ({
+  return ["上午", "下午", "晚上"].map((label, index) => ({
     uid: newSlotUid(),
     label,
-    startMinute: null,
-    endMinute: null,
+    startMinute: index === 0 ? 8 * 60 : index === 1 ? 13 * 60 : 18 * 60,
+    endMinute: index === 0 ? 12 * 60 : index === 1 ? 17 * 60 : 21 * 60,
     note: "",
     placeIds: [],
     noteExpanded: false,
@@ -155,11 +154,9 @@ function formatDateTime(value: string): string {
 
 function initItineraryDraft(slots: ItinerarySlot[]): void {
   if (slots.length === 0) {
-    useCustomSlots.value = false;
     itinerarySlots.value = createDefaultSlots();
     return;
   }
-  useCustomSlots.value = slots.every((slot) => slot.start_minute !== null && slot.end_minute !== null);
   itinerarySlots.value = slots.map((slot) => ({
     uid: newSlotUid(),
     id: slot.id,
@@ -170,9 +167,6 @@ function initItineraryDraft(slots: ItinerarySlot[]): void {
     placeIds: slot.places.map((item) => item.place_id),
     noteExpanded: false,
   }));
-  if (!useCustomSlots.value && itinerarySlots.value.length === 0) {
-    itinerarySlots.value = createDefaultSlots();
-  }
 }
 
 async function loadItinerary(): Promise<void> {
@@ -193,25 +187,21 @@ function validateItineraryDraft(): string | null {
   if (itinerarySlots.value.length === 0) {
     return "请至少保留一个时段";
   }
-  if (useCustomSlots.value) {
-    const ranges: Array<{ start: number; end: number }> = [];
-    for (let i = 0; i < itinerarySlots.value.length; i += 1) {
-      const slot = itinerarySlots.value[i];
-      if (!slot.label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
-      if (slot.startMinute === null || slot.endMinute === null) return "自定义时段必须填写开始与结束时间";
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
+    const slot = itinerarySlots.value[i];
+    if (!slot.label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
+    if ((slot.startMinute === null) !== (slot.endMinute === null)) return `第 ${i + 1} 个时段时间需同时填写开始和结束`;
+    if (slot.startMinute !== null && slot.endMinute !== null) {
       if (slot.startMinute < 0 || slot.endMinute > 1440 || slot.startMinute >= slot.endMinute) {
         return `第 ${i + 1} 个时段时间非法`;
       }
       ranges.push({ start: slot.startMinute, end: slot.endMinute });
     }
-    ranges.sort((a, b) => a.start - b.start);
-    for (let i = 1; i < ranges.length; i += 1) {
-      if (ranges[i].start < ranges[i - 1].end) return "自定义时段之间不能重叠";
-    }
-    return null;
   }
-  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
-    if (!itinerarySlots.value[i].label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
+  ranges.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < ranges.length; i += 1) {
+    if (ranges[i].start < ranges[i - 1].end) return "已设置时间的时段之间不能重叠";
   }
   return null;
 }
@@ -230,16 +220,12 @@ async function saveItinerary(): Promise<void> {
   }
   itinerarySaving.value = true;
   try {
-    const slotsToSave = [...itinerarySlots.value];
-    if (useCustomSlots.value) {
-      slotsToSave.sort((a, b) => (a.startMinute ?? 0) - (b.startMinute ?? 0));
-    }
     const payload: ItineraryUpdatePayload = {
-      slots: slotsToSave.map((slot, index) => ({
+      slots: itinerarySlots.value.map((slot, index) => ({
         id: slot.id,
         label: slot.label.trim(),
-        start_minute: useCustomSlots.value ? slot.startMinute : null,
-        end_minute: useCustomSlots.value ? slot.endMinute : null,
+        start_minute: slot.startMinute,
+        end_minute: slot.endMinute,
         sort_index: index,
         note: slot.note.trim(),
         place_ids: [...slot.placeIds],
@@ -254,39 +240,7 @@ async function saveItinerary(): Promise<void> {
     itinerarySaving.value = false;
   }
 }
-
-function setSlotMode(custom: boolean): void {
-  if (useCustomSlots.value === custom) return;
-  useCustomSlots.value = custom;
-  itineraryError.value = null;
-  itineraryTip.value = null;
-  if (!custom && itinerarySlots.value.length === 0) {
-    itinerarySlots.value = createDefaultSlots();
-  }
-  if (!custom) {
-    for (const slot of itinerarySlots.value) {
-      slot.startMinute = null;
-      slot.endMinute = null;
-    }
-    return;
-  }
-  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
-    const slot = itinerarySlots.value[i];
-    if (slot.startMinute !== null && slot.endMinute !== null) continue;
-    if (i === 0) {
-      slot.startMinute = 8 * 60;
-      slot.endMinute = 12 * 60;
-    } else if (i === 1) {
-      slot.startMinute = 13 * 60;
-      slot.endMinute = 17 * 60;
-    } else {
-      slot.startMinute = 18 * 60;
-      slot.endMinute = 21 * 60;
-    }
-  }
-}
-
-function addCustomSlot(): void {
+function addItinerarySlot(): void {
   itinerarySlots.value.push({
     uid: newSlotUid(),
     label: `时段 ${itinerarySlots.value.length + 1}`,
@@ -298,7 +252,7 @@ function addCustomSlot(): void {
   });
 }
 
-function removeCustomSlot(uid: string): void {
+function removeItinerarySlot(uid: string): void {
   itinerarySlots.value = itinerarySlots.value.filter((slot) => slot.uid !== uid);
 }
 
@@ -802,12 +756,14 @@ function onDocumentClickForMapScope(event: MouseEvent): void {
 }
 
 function locatePlace(place: Place): void {
+  applyMapScopeSelection("plan");
   setPlaceDraft({
     name: place.name,
     address: place.address,
     longitude: place.longitude,
     latitude: place.latitude,
   }, false);
+  ensureMapCenteredInViewport();
 }
 
 function showAllHistoryPlacesOnMap(): void {
@@ -967,13 +923,7 @@ onBeforeUnmount(() => {
               <div class="section-title-row">
                 <h3>时段行程</h3>
                 <div class="section-actions">
-                  <button type="button" class="btn small" :class="{ active: !useCustomSlots }" @click="setSlotMode(false)">
-                    上午/下午/晚上
-                  </button>
-                  <button type="button" class="btn small" :class="{ active: useCustomSlots }" @click="setSlotMode(true)">
-                    自定义时段
-                  </button>
-                  <button v-if="useCustomSlots" type="button" class="btn small" @click="addCustomSlot">新增时段</button>
+                  <button type="button" class="btn small" @click="addItinerarySlot">新增时段</button>
                   <button type="button" class="btn small primary" :disabled="itinerarySaving" @click="saveItinerary">
                     {{ itinerarySaving ? "保存中..." : "保存时段行程" }}
                   </button>
@@ -992,7 +942,6 @@ onBeforeUnmount(() => {
                     </button>
                     <div class="item-actions">
                       <button
-                        v-if="!useCustomSlots"
                         type="button"
                         class="btn small"
                         :disabled="index === 0"
@@ -1001,7 +950,6 @@ onBeforeUnmount(() => {
                         上移
                       </button>
                       <button
-                        v-if="!useCustomSlots"
                         type="button"
                         class="btn small"
                         :disabled="index === itinerarySlots.length - 1"
@@ -1010,11 +958,10 @@ onBeforeUnmount(() => {
                         下移
                       </button>
                       <button
-                        v-if="useCustomSlots"
                         type="button"
                         class="btn small danger"
                         :disabled="itinerarySlots.length <= 1"
-                        @click="removeCustomSlot(slot.uid)"
+                        @click="removeItinerarySlot(slot.uid)"
                       >
                         删除时段
                       </button>
@@ -1027,7 +974,7 @@ onBeforeUnmount(() => {
                         时段名称
                         <input v-model.trim="slot.label" type="text" maxlength="30" :disabled="itinerarySaving" />
                       </label>
-                      <label v-if="useCustomSlots">
+                      <label>
                         开始时间
                         <input
                           :value="minuteToTimeText(slot.startMinute)"
@@ -1036,7 +983,7 @@ onBeforeUnmount(() => {
                           @input="slot.startMinute = timeTextToMinute(String(($event.target as HTMLInputElement).value))"
                         />
                       </label>
-                      <label v-if="useCustomSlots">
+                      <label>
                         结束时间
                         <input
                           :value="minuteToTimeText(slot.endMinute)"
@@ -1095,7 +1042,6 @@ onBeforeUnmount(() => {
                       <span>{{ place.address }}</span>
                     </button>
                     <div class="item-actions">
-                      <button type="button" class="btn small" @click="locatePlace(place)">显示</button>
                       <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
                       <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
                     </div>
@@ -1357,20 +1303,20 @@ h3 {
   padding: 0;
   list-style: none;
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 .itinerary-item {
   border: 1px solid #dbeafe;
   border-radius: 8px;
   background: #fff;
-  padding: 10px;
+  padding: 8px;
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 .itinerary-head {
   display: flex;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
 }
 .itinerary-main {
@@ -1388,7 +1334,7 @@ h3 {
 }
 .itinerary-editor {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 .assign-row {
   display: flex;
@@ -1426,7 +1372,7 @@ h3 {
 }
 .note-block {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 .note-block textarea {
   border: 1px solid #d1d5db;
