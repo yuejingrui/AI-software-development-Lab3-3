@@ -3,7 +3,7 @@ import type { ApiResponse } from "../types/api";
 
 function getBaseUrl(): string {
   const env = import.meta.env.VITE_API_BASE_URL;
-  return env && env.trim().length > 0 ? env : "http://127.0.0.1:8000";
+  return env && env.trim().length > 0 ? env : "/api";
 }
 
 async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE", payload?: unknown): Promise<T> {

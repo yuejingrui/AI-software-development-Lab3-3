@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections import defaultdict
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Literal
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -17,7 +19,7 @@ from pydantic import BaseModel, Field
 from .db import db_conn, init_db
 from .errors import AppError, ErrorCode
 from .response import ApiResponse, ok
-from .secrets import YourJsKey, YourSecurityJsCode, YourWebServiceKey
+from .secrets import YourJsKey, YourKeyKey, YourSecret, YourSecurityJsCode, YourWebServiceKey
 
 
 class HealthData(BaseModel):
@@ -174,6 +176,24 @@ class WeatherRiskData(BaseModel):
 
 class PlanRiskCheckData(BaseModel):
     weather_risk: WeatherRiskData
+
+
+class AiSummaryHistoryItemInput(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=2000)
+
+
+class AiSummaryInput(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    history: list[AiSummaryHistoryItemInput] = Field(default_factory=list)
+
+
+class AiSummaryData(BaseModel):
+    reply: str
+    strengths: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    used_weather_fallback: bool
 
 
 def _now_iso() -> str:
@@ -581,12 +601,293 @@ def _evaluate_weather_risk(plan: PlanData, places: list[PlaceData]) -> WeatherRi
     )
 
 
+def _resolve_glm_api_key() -> str:
+    preferred = str(YourKeyKey).strip()
+    fallback = str(YourSecret).strip()
+    key = preferred if preferred and not _is_placeholder(preferred) else fallback
+    if not key or _is_placeholder(key):
+        raise AppError(code=ErrorCode.VALIDATION, message="后端 AI 密钥未配置，请先修改 backend/app/secrets.py", http_status=400)
+    return key
+
+
+def _season_hint_text(plan_date_text: str) -> str:
+    try:
+        month = date.fromisoformat(plan_date_text).month
+    except Exception:
+        month = 4
+    if month in (12, 1, 2):
+        return "冬季，通常偏冷，建议保暖并优先考虑室内或防风路线。"
+    if month in (3, 4, 5):
+        return "春季，通常温和但早晚温差可能较大，建议洋葱式穿搭。"
+    if month in (6, 7, 8):
+        return "夏季，通常炎热，建议避开正午暴晒并注意补水。"
+    return "秋季，通常较舒适但昼夜温差逐步增大，建议备薄外套。"
+
+
+def _web_search_snippets(query: str, max_items: int = 3, timeout_sec: float = 2.0) -> list[str]:
+    keyword = query.strip()
+    if not keyword:
+        return []
+    params = urlencode({"q": keyword, "format": "json", "no_html": "1", "no_redirect": "1"})
+    url = f"https://api.duckduckgo.com/?{params}"
+    request = UrlRequest(url=url, method="GET", headers={"User-Agent": "Lab3-2/ai-summary"})
+    try:
+        with urlopen(request, timeout=timeout_sec) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+    snippets: list[str] = []
+    abstract_text = str(payload.get("AbstractText") or "").strip()
+    if abstract_text:
+        snippets.append(abstract_text)
+    related_topics = payload.get("RelatedTopics") or []
+    for item in related_topics:
+        if isinstance(item, dict) and item.get("Text"):
+            snippets.append(str(item.get("Text")))
+        elif isinstance(item, dict):
+            nested = item.get("Topics") or []
+            for nested_item in nested:
+                if isinstance(nested_item, dict) and nested_item.get("Text"):
+                    snippets.append(str(nested_item.get("Text")))
+                    if len(snippets) >= max_items:
+                        break
+        if len(snippets) >= max_items:
+            break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for text in snippets:
+        normalized = text.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _weather_context_for_ai(plan: PlanData, places: list[PlaceData]) -> tuple[str, bool]:
+    if not places:
+        return f"暂无规划地点；天气不可用时请按季节给建议：{_season_hint_text(plan.date)}", True
+    first = places[0]
+    try:
+        province, city, district, adcode = _resolve_admin_by_location(first.longitude, first.latitude)
+        live_body = _amap_get(
+            "/v3/weather/weatherInfo",
+            {
+                "key": YourWebServiceKey,
+                "city": adcode,
+                "extensions": "base",
+            },
+        )
+        weather_text = "未知"
+        temperature_text = "未知"
+        if live_body.get("status") == "1":
+            lives = live_body.get("lives") or []
+            if lives:
+                live = lives[0] or {}
+                weather_text = str(live.get("weather") or "未知").strip()
+                temperature_text = str(live.get("temperature") or "未知").strip()
+        forecast = _load_weather_forecast_by_adcode(adcode)
+        matched = next((item for item in forecast if item.date == plan.date), None)
+        if matched is None:
+            return (
+                f"地点行政区：{province}{city}{district}；实时天气：{weather_text}，气温 {temperature_text}℃。"
+                f"规划日期 {plan.date} 无可用预报，请按季节给建议：{_season_hint_text(plan.date)}",
+                True,
+            )
+        return (
+            f"地点行政区：{province}{city}{district}；实时天气：{weather_text}，气温 {temperature_text}℃；"
+            f"规划日期 {plan.date} 预报：{matched.weather}，{matched.low_temp_c}~{matched.high_temp_c}℃。",
+            False,
+        )
+    except Exception:
+        return f"天气服务暂不可用，请按季节给建议：{_season_hint_text(plan.date)}", True
+
+
+def _load_search_city_hint(places: list[PlaceData]) -> str:
+    if not places:
+        return "目的地"
+    first = places[0]
+    try:
+        _, city, _, _ = _resolve_admin_by_location(first.longitude, first.latitude)
+        return city or "目的地"
+    except Exception:
+        return places[0].address or "目的地"
+
+
+def _itinerary_context_text(slots: list[ItinerarySlotData]) -> str:
+    if not slots:
+        return "暂无时段安排。"
+    lines: list[str] = []
+    for slot in slots:
+        if slot.start_minute is not None and slot.end_minute is not None:
+            start_h = slot.start_minute // 60
+            start_m = slot.start_minute % 60
+            end_h = slot.end_minute // 60
+            end_m = slot.end_minute % 60
+            slot_time = f"{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d}"
+        else:
+            slot_time = slot.label
+        place_names = "、".join(place.name for place in slot.places) if slot.places else "未分配地点"
+        note = slot.note.strip()
+        line = f"- {slot_time} {slot.label}：{place_names}"
+        if note:
+            line += f"；备注：{note}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _parse_ai_json_response(content: str) -> tuple[str, list[str], list[str], list[str]]:
+    text = content.strip()
+    if not text:
+        return ("未获取到 AI 回复", [], [], [])
+    candidate = text
+    if not (candidate.startswith("{") and candidate.endswith("}")):
+        matched = re.search(r"\{[\s\S]*\}", text)
+        if matched:
+            candidate = matched.group(0)
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return (text, [], [], [])
+    reply = str(parsed.get("reply") or "").strip() or text
+    strengths_raw = parsed.get("strengths") or []
+    risks_raw = parsed.get("risks") or []
+    improvements_raw = parsed.get("improvements") or []
+    strengths = [str(item).strip() for item in strengths_raw if str(item).strip()]
+    risks = [str(item).strip() for item in risks_raw if str(item).strip()]
+    improvements = [str(item).strip() for item in improvements_raw if str(item).strip()]
+    return (reply, strengths[:5], risks[:5], improvements[:5])
+
+
+def _call_glm_for_summary(
+    plan: PlanData,
+    places: list[PlaceData],
+    itinerary_slots: list[ItinerarySlotData],
+    payload: AiSummaryInput,
+) -> AiSummaryData:
+    api_key = _resolve_glm_api_key()
+    weather_context, used_weather_fallback = _weather_context_for_ai(plan, places)
+    city_hint = _load_search_city_hint(places)
+    web_deadline = time.monotonic() + 4.0
+    budget_query = f"{city_hint} 旅游 人均 消费 水平 餐饮 交通 门票"
+    budget_snippets = _web_search_snippets(budget_query, max_items=3, timeout_sec=1.5)
+    place_names = [place.name for place in places[:3]]
+    attraction_snippets: list[str] = []
+    for place_name in place_names:
+        if time.monotonic() > web_deadline:
+            break
+        snippets = _web_search_snippets(f"{place_name} 建议游玩时长 适合游览时间", max_items=2, timeout_sec=1.5)
+        attraction_snippets.extend(snippets)
+        if len(attraction_snippets) >= 6:
+            break
+    attraction_snippets = attraction_snippets[:6]
+
+    places_text = "、".join([f"{item.name}({item.address})" for item in places]) if places else "暂无地点"
+    budget_per_person = plan.budget / max(plan.people_count, 1)
+    itinerary_text = _itinerary_context_text(itinerary_slots)
+    history_for_prompt = [
+        {"role": item.role, "content": item.content.strip()}
+        for item in payload.history[-10:]
+        if item.content.strip()
+    ]
+    system_prompt = f"""
+你是旅行规划助手。请基于提供的结构化上下文生成建议，输出必须是 JSON：
+{{
+  "reply": "给用户的综合建议，2-4 段",
+  "strengths": ["优点1", "优点2"],
+  "risks": ["风险1", "风险2"],
+  "improvements": ["改进点1", "改进点2"]
+}}
+请严格遵守：
+1) 根据天气信息给出出行建议；若当天天气不可用，按日期对应季节给当地典型天气建议。
+2) 结合预算、人数与联网检索到的消费水平信息，判断是否可能超预算并给建议。
+3) 结合时段安排与联网检索到的景点信息（建议游玩时长/时机）提出可执行建议。
+4) 认真阅读备注，给个性化建议。
+5) AI 只是辅助解释，不要替代用户决策；不要虚构不在上下文中的确定性事实，如不确定请明确说明。
+上下文如下：
+- 规划标题：{plan.title}
+- 日期：{plan.date}
+- 预算：{plan.budget} 元
+- 人数：{plan.people_count} 人
+- 人均预算：{budget_per_person:.2f} 元
+- 用户备注：{plan.preferences or "无"}
+- 地点列表：{places_text}
+- 天气上下文：{weather_context}
+- 时段安排：
+{itinerary_text}
+- 联网检索（消费水平）：
+{chr(10).join(f"* {line}" for line in budget_snippets) if budget_snippets else "* 未检索到有效结果，请用保守估计并说明不确定性"}
+- 联网检索（景点游览建议）：
+{chr(10).join(f"* {line}" for line in attraction_snippets) if attraction_snippets else "* 未检索到有效结果，请基于通用经验给出建议并说明不确定性"}
+""".strip()
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history_for_prompt)
+    messages.append({"role": "user", "content": payload.question.strip()})
+
+    request_body = {
+        "model": "glm-4-flash",
+        "temperature": 0.4,
+        "messages": messages,
+    }
+    request = UrlRequest(
+        url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+    )
+    try:
+        with urlopen(request, timeout=12) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            detail = ""
+        raise AppError(code=ErrorCode.HTTP, message=f"AI 服务调用失败: HTTP {exc.code} {detail}".strip(), http_status=502) from exc
+    except URLError as exc:
+        raise AppError(code=ErrorCode.HTTP, message=f"AI 服务网络错误: {exc}", http_status=502) from exc
+    except Exception as exc:
+        raise AppError(code=ErrorCode.HTTP, message=f"AI 服务调用失败: {exc}", http_status=502) from exc
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise AppError(code=ErrorCode.HTTP, message="AI 服务返回内容为空", http_status=502)
+    message = choices[0].get("message") or {}
+    content_obj = message.get("content")
+    if isinstance(content_obj, str):
+        content_text = content_obj
+    elif isinstance(content_obj, list):
+        chunks: list[str] = []
+        for item in content_obj:
+            if isinstance(item, dict):
+                chunks.append(str(item.get("text") or ""))
+            else:
+                chunks.append(str(item))
+        content_text = "".join(chunks).strip()
+    else:
+        content_text = str(content_obj or "").strip()
+    reply, strengths, risks, improvements = _parse_ai_json_response(content_text)
+    return AiSummaryData(
+        reply=reply,
+        strengths=strengths,
+        risks=risks,
+        improvements=improvements,
+        used_weather_fallback=used_weather_fallback,
+    )
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Lab3-2 API")
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -861,6 +1162,40 @@ def create_app() -> FastAPI:
             conn.commit()
         _invalidate_plan_risk_check_cache(plan_id)
         return ok(_load_plan_itinerary(plan_id))
+
+    @app.post("/plans/{plan_id}/ai-summary", response_model=ApiResponse[AiSummaryData])
+    def plan_ai_summary(plan_id: int, payload: AiSummaryInput) -> ApiResponse[AiSummaryData]:
+        _ensure_plan_exists(plan_id)
+        plan = _load_plan(plan_id)
+        places = _load_plan_places(plan_id)
+        itinerary_slots = _load_plan_itinerary(plan_id)
+        try:
+            result = _call_glm_for_summary(plan=plan, places=places, itinerary_slots=itinerary_slots, payload=payload)
+        except AppError:
+            # 降级为本地规则建议，避免前端出现“Failed to fetch”并中断使用。
+            place_count = len(places)
+            has_notes = bool(plan.preferences.strip())
+            result = AiSummaryData(
+                reply=(
+                    "AI 服务当前不可用，已返回降级建议："
+                    "请优先检查天气与时段冲突、核对预算与人数的人均成本，并在关键时段预留机动时间。"
+                ),
+                strengths=[
+                    "已完成基础规划信息（日期/预算/人数）",
+                    f"已加入地点数量：{place_count}",
+                ],
+                risks=[
+                    "外部 AI 服务暂时不可用，建议稍后重试",
+                    "若当天天气突变，户外时段可能需要调整",
+                ],
+                improvements=[
+                    "优先补齐每个时段的核心地点与预计停留时长",
+                    "为交通与排队预留 15~30 分钟缓冲",
+                    "若有个性化备注，建议逐项映射到时段安排" if has_notes else "可补充个性化备注以获得更精准建议",
+                ],
+                used_weather_fallback=True,
+            )
+        return ok(result)
 
     @app.get("/map/config", response_model=ApiResponse[MapConfigData])
     def get_map_config() -> ApiResponse[MapConfigData]:

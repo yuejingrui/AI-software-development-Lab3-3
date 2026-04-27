@@ -2,6 +2,7 @@
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import PlanForm from "../components/PlanForm.vue";
+import AiSummaryPanel from "../components/AiSummaryPanel.vue";
 import WeatherSidebar from "../components/WeatherSidebar.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
@@ -1122,6 +1123,10 @@ onBeforeUnmount(() => {
             </div>
           </section>
         </div>
+
+        <aside class="ai-column">
+          <AiSummaryPanel :plan-id="planId" :plan-title="draft.title" />
+        </aside>
       </div>
     </template>
   </main>
@@ -1129,13 +1134,13 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .container {
-  max-width: 1320px;
+  max-width: 1640px;
   margin: 32px auto;
   padding: 0 16px 24px;
 }
 .page-grid {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr) 360px;
   gap: 14px;
   align-items: start;
 }
@@ -1145,6 +1150,10 @@ onBeforeUnmount(() => {
 }
 .content-column {
   min-width: 0;
+}
+.ai-column {
+  position: sticky;
+  top: 12px;
 }
 .header {
   display: flex;
@@ -1433,6 +1442,9 @@ h3 {
     grid-template-columns: 1fr;
   }
   .weather-column {
+    position: static;
+  }
+  .ai-column {
     position: static;
   }
 }
