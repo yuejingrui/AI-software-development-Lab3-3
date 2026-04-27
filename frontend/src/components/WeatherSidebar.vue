@@ -90,26 +90,6 @@ const hasPlanDateForecast = computed(() => {
   return displayForecast.value.some((item) => item.date === props.planDate);
 });
 
-const budgetLevelText = computed(() => {
-  const level = riskCheck.value?.budget_risk.level;
-  if (level === "budget_ample") return "预算充裕";
-  if (level === "budget_tight") return "预算紧张";
-  if (level === "budget_over") return "建议增加预算";
-  return "预算评估中";
-});
-
-const budgetLevelClass = computed(() => {
-  const level = riskCheck.value?.budget_risk.level;
-  if (level === "budget_ample") return "ok";
-  if (level === "budget_tight") return "warn";
-  return "danger";
-});
-
-function formatMoney(amount: number): string {
-  if (!Number.isFinite(amount)) return "-";
-  return `¥${amount.toFixed(2)}`;
-}
-
 async function loadWeather(): Promise<void> {
   loading.value = true;
   loadError.value = null;
@@ -244,19 +224,6 @@ watch(
         <p v-else-if="riskLoading" class="status">规则检查中...</p>
         <template v-else-if="riskCheck">
           <div class="risk-item">
-            <p class="risk-title">预算风险</p>
-            <p class="risk-value" :class="budgetLevelClass">{{ budgetLevelText }}</p>
-            <p class="risk-meta">
-              预计总消费 {{ formatMoney(riskCheck.budget_risk.estimated_total) }} / 预算
-              {{ formatMoney(riskCheck.budget_risk.budget) }}
-            </p>
-            <p class="risk-meta">按地点消费 × 人数（{{ riskCheck.budget_risk.people_count }} 人）估算</p>
-            <p v-if="riskCheck.budget_risk.missing_cost_places > 0" class="status warn">
-              有 {{ riskCheck.budget_risk.missing_cost_places }} 个地点暂无 cost 数据，估算可能偏低
-            </p>
-          </div>
-
-          <div class="risk-item">
             <p class="risk-title">雨天户外风险</p>
             <p class="risk-value" :class="riskCheck.weather_risk.has_rain_or_snow ? 'warn' : 'ok'">
               {{ riskCheck.weather_risk.suggestion }}
@@ -369,9 +336,6 @@ h3 {
 }
 .risk-value.warn {
   color: #b45309;
-}
-.risk-value.danger {
-  color: #b91c1c;
 }
 .risk-meta {
   margin: 0;

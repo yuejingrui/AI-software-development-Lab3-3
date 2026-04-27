@@ -165,17 +165,6 @@ class WeatherByLocationData(BaseModel):
     forecast: list[WeatherForecastDayData]
 
 
-class BudgetRiskData(BaseModel):
-    level: str
-    suggestion: str
-    estimated_total: float
-    budget: float
-    ratio: float
-    people_count: int
-    priced_places: int
-    missing_cost_places: int
-
-
 class WeatherRiskData(BaseModel):
     has_forecast_for_plan_date: bool
     has_rain_or_snow: bool
@@ -184,7 +173,6 @@ class WeatherRiskData(BaseModel):
 
 
 class PlanRiskCheckData(BaseModel):
-    budget_risk: BudgetRiskData
     weather_risk: WeatherRiskData
 
 
@@ -436,21 +424,6 @@ def _parse_float(value: Any, fallback: float = 0.0) -> float:
         return fallback
 
 
-def _parse_poi_cost_to_float(raw_cost: Any) -> float | None:
-    text = str(raw_cost or "").strip()
-    if not text:
-        return None
-    if any(token in text for token in ("免费", "无", "暂无")):
-        return 0.0
-    numbers = [_parse_float(item, float("nan")) for item in re.findall(r"\d+(?:\.\d+)?", text)]
-    clean = [value for value in numbers if value == value]
-    if not clean:
-        return None
-    if len(clean) == 1:
-        return clean[0]
-    return sum(clean) / len(clean)
-
-
 def _wind_power_to_mps(wind_power_text: str) -> float:
     # 高德返回风力等级，需求里要求使用 m/s，这里用蒲福等级近似换算。
     beaufort_to_mps = {
@@ -541,70 +514,6 @@ def _load_weather_forecast_by_adcode(adcode: str) -> list[WeatherForecastDayData
             )
         )
     return forecast
-
-
-def _evaluate_budget_risk(plan: PlanData, places: list[PlaceData]) -> BudgetRiskData:
-    estimated_total = 0.0
-    priced_places = 0
-    for place in places:
-        body = _amap_get(
-            "/v3/place/around",
-            {
-                "key": YourWebServiceKey,
-                "location": f"{place.longitude},{place.latitude}",
-                "radius": "200",
-                "offset": "1",
-                "page": "1",
-                "extensions": "all",
-                "keywords": place.name.strip() or place.address.strip(),
-            },
-        )
-        if body.get("status") != "1":
-            info = str(body.get("info") or "地点消费信息查询失败")
-            # 高德配额/QPS限制时降级处理，避免整页报错。
-            if "EXCEEDED_THE_LIMIT" in info or "LIMIT" in info:
-                continue
-            raise AppError(code=ErrorCode.HTTP, message=info, http_status=502)
-        pois = body.get("pois") or []
-        if not pois:
-            continue
-        cost_value = _parse_poi_cost_to_float((pois[0] or {}).get("cost"))
-        if cost_value is None:
-            continue
-        estimated_total += cost_value * float(plan.people_count)
-        priced_places += 1
-    if places and priced_places == 0:
-        return BudgetRiskData(
-            level="budget_tight",
-            suggestion="预算紧张（消费数据暂不可用，建议稍后重试）",
-            estimated_total=0.0,
-            budget=round(max(0.0, float(plan.budget)), 2),
-            ratio=0.75,
-            people_count=plan.people_count,
-            priced_places=0,
-            missing_cost_places=len(places),
-        )
-    budget = max(0.0, float(plan.budget))
-    ratio = estimated_total / budget if budget > 0 else (1.0 if estimated_total == 0 else 1.06)
-    if ratio < 0.75:
-        level = "budget_ample"
-        suggestion = "预算充裕"
-    elif ratio <= 1.05:
-        level = "budget_tight"
-        suggestion = "预算紧张"
-    else:
-        level = "budget_over"
-        suggestion = "建议增加预算"
-    return BudgetRiskData(
-        level=level,
-        suggestion=suggestion,
-        estimated_total=round(estimated_total, 2),
-        budget=round(budget, 2),
-        ratio=ratio,
-        people_count=plan.people_count,
-        priced_places=priced_places,
-        missing_cost_places=max(0, len(places) - priced_places),
-    )
 
 
 def _evaluate_weather_risk(plan: PlanData, places: list[PlaceData]) -> WeatherRiskData:
@@ -827,9 +736,8 @@ def create_app() -> FastAPI:
             return ok(cached)
         plan = _load_plan(plan_id)
         places = _load_plan_places(plan_id)
-        budget_risk = _evaluate_budget_risk(plan, places)
         weather_risk = _evaluate_weather_risk(plan, places)
-        result = PlanRiskCheckData(budget_risk=budget_risk, weather_risk=weather_risk)
+        result = PlanRiskCheckData(weather_risk=weather_risk)
         _save_plan_risk_check_cache(plan_id, result)
         return ok(result)
 
