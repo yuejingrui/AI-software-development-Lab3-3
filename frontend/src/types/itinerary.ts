@@ -11,6 +11,7 @@ export type ItinerarySlotPlace = {
 export type ItinerarySlot = {
   id: number;
   plan_id: number;
+  day_index: number;
   label: string;
   start_minute: number | null;
   end_minute: number | null;
@@ -21,6 +22,7 @@ export type ItinerarySlot = {
 
 export type ItinerarySlotPayload = {
   id?: number;
+  day_index: number;
   label: string;
   start_minute: number | null;
   end_minute: number | null;

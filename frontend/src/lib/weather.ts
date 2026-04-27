@@ -6,5 +6,5 @@ export async function fetchWeatherByLocation(longitude: number, latitude: number
     longitude: String(longitude),
     latitude: String(latitude),
   });
-  return apiGet<WeatherByLocation>(`/weather/by-location?${qs.toString()}`);
+  return apiGet<WeatherByLocation>(`/weather/by-location?${qs.toString()}`, { silent: true });
 }

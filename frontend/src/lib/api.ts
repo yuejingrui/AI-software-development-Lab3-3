@@ -6,7 +6,16 @@ function getBaseUrl(): string {
   return env && env.trim().length > 0 ? env : "/api";
 }
 
-async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT" | "DELETE", payload?: unknown): Promise<T> {
+type ApiRequestOptions = {
+  silent?: boolean;
+};
+
+async function apiRequest<T>(
+  path: string,
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  payload?: unknown,
+  options: ApiRequestOptions = {}
+): Promise<T> {
   const url = `${getBaseUrl()}${path}`;
   try {
     const res = await fetch(url, {
@@ -14,9 +23,21 @@ async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT" | "DEL
       headers: { "Content-Type": "application/json" },
       body: payload === undefined ? undefined : JSON.stringify(payload),
     });
-    const parsedBody = (await res.json()) as ApiResponse<T>;
+    const rawBody = await res.text();
+    let parsedBody: ApiResponse<T> | null = null;
+    if (rawBody.trim().length > 0) {
+      try {
+        parsedBody = JSON.parse(rawBody) as ApiResponse<T>;
+      } catch {
+        parsedBody = null;
+      }
+    }
     if (!res.ok) {
-      throw new Error(parsedBody?.message ?? `HTTP ${res.status}`);
+      const fallbackMessage = rawBody.trim() || `HTTP ${res.status}`;
+      throw new Error(parsedBody?.message ?? fallbackMessage);
+    }
+    if (!parsedBody) {
+      throw new Error("服务响应格式错误");
     }
     if (parsedBody.code !== 0) {
       throw new Error(parsedBody.message || "API error");
@@ -24,13 +45,15 @@ async function apiRequest<T>(path: string, method: "GET" | "POST" | "PUT" | "DEL
     return parsedBody.data as T;
   } catch (e) {
     const message = e instanceof Error ? e.message : "Network error";
-    setGlobalError(message);
+    if (!options.silent) {
+      setGlobalError(message);
+    }
     throw e;
   }
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
-  return apiRequest<T>(path, "GET");
+export async function apiGet<T>(path: string, options?: ApiRequestOptions): Promise<T> {
+  return apiRequest<T>(path, "GET", undefined, options);
 }
 
 export async function apiPost<T>(path: string, body: unknown): Promise<T> {

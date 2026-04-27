@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import PlanForm from "../components/PlanForm.vue";
 import AiSummaryPanel from "../components/AiSummaryPanel.vue";
@@ -65,6 +65,8 @@ const searchKeyword = ref("");
 const searchLoading = ref(false);
 const searchError = ref<string | null>(null);
 const searchResults = ref<PlacePayload[]>([]);
+const SEARCH_DEBOUNCE_MS = 250;
+let searchDebounceTimer: number | null = null;
 const HOTSPOT_CLICK_SUPPRESS_MS = 300;
 let lastHotspotClickAt = 0;
 
@@ -82,6 +84,7 @@ let itinerarySlotIdSeed = 0;
 type ItineraryDraftSlot = {
   uid: string;
   id?: number;
+  dayIndex: number;
   label: string;
   startMinute: number | null;
   endMinute: number | null;
@@ -91,6 +94,8 @@ type ItineraryDraftSlot = {
 };
 
 const itinerarySlots = ref<ItineraryDraftSlot[]>([]);
+const planDays = ref(1);
+const selectedDay = ref(1);
 
 function bumpRiskCheckVersion(): void {
   riskCheckVersion.value += 1;
@@ -101,9 +106,10 @@ function newSlotUid(): string {
   return `slot-${Date.now()}-${itinerarySlotIdSeed}`;
 }
 
-function createDefaultSlots(): ItineraryDraftSlot[] {
+function createDefaultSlots(dayIndex: number): ItineraryDraftSlot[] {
   return ["上午", "下午", "晚上"].map((label, index) => ({
     uid: newSlotUid(),
+    dayIndex,
     label,
     startMinute: index === 0 ? 8 * 60 : index === 1 ? 13 * 60 : 18 * 60,
     endMinute: index === 0 ? 12 * 60 : index === 1 ? 17 * 60 : 21 * 60,
@@ -111,6 +117,44 @@ function createDefaultSlots(): ItineraryDraftSlot[] {
     placeIds: [],
     noteExpanded: false,
   }));
+}
+
+function dayDateText(dayIndex: number): string {
+  const baseText = draft.date.trim();
+  if (!baseText) return `第${dayIndex}天`;
+  const baseDate = new Date(`${baseText}T00:00:00`);
+  if (Number.isNaN(baseDate.getTime())) return `第${dayIndex}天`;
+  baseDate.setDate(baseDate.getDate() + dayIndex - 1);
+  const year = baseDate.getFullYear();
+  const month = String(baseDate.getMonth() + 1).padStart(2, "0");
+  const day = String(baseDate.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+const currentDaySlots = computed(() => {
+  return itinerarySlots.value.filter((slot) => slot.dayIndex === selectedDay.value);
+});
+
+function ensureDaySlots(dayIndex: number): void {
+  if (itinerarySlots.value.some((slot) => slot.dayIndex === dayIndex)) return;
+  itinerarySlots.value.push(...createDefaultSlots(dayIndex));
+}
+
+function setPlanDays(nextDays: number): void {
+  const safeDays = Math.max(1, Math.min(30, Math.trunc(nextDays)));
+  planDays.value = safeDays;
+  itinerarySlots.value = itinerarySlots.value.filter((slot) => slot.dayIndex <= safeDays);
+  for (let day = 1; day <= safeDays; day += 1) {
+    ensureDaySlots(day);
+  }
+  if (selectedDay.value > safeDays) selectedDay.value = safeDays;
+}
+
+function replaceCurrentDaySlots(nextSlots: ItineraryDraftSlot[]): void {
+  itinerarySlots.value = [
+    ...itinerarySlots.value.filter((slot) => slot.dayIndex !== selectedDay.value),
+    ...nextSlots.map((slot) => ({ ...slot, dayIndex: selectedDay.value })),
+  ];
 }
 
 function minuteToTimeText(minute: number | null): string {
@@ -154,12 +198,18 @@ function formatDateTime(value: string): string {
 
 function initItineraryDraft(slots: ItinerarySlot[]): void {
   if (slots.length === 0) {
-    itinerarySlots.value = createDefaultSlots();
+    planDays.value = 1;
+    selectedDay.value = 1;
+    itinerarySlots.value = createDefaultSlots(1);
     return;
   }
+  const maxDay = Math.max(1, ...slots.map((slot) => Math.max(1, slot.day_index)));
+  planDays.value = maxDay;
+  selectedDay.value = Math.min(selectedDay.value, maxDay);
   itinerarySlots.value = slots.map((slot) => ({
     uid: newSlotUid(),
     id: slot.id,
+    dayIndex: Math.max(1, slot.day_index),
     label: slot.label,
     startMinute: slot.start_minute,
     endMinute: slot.end_minute,
@@ -184,24 +234,25 @@ async function loadItinerary(): Promise<void> {
 }
 
 function validateItineraryDraft(): string | null {
-  if (itinerarySlots.value.length === 0) {
-    return "请至少保留一个时段";
-  }
-  const ranges: Array<{ start: number; end: number }> = [];
-  for (let i = 0; i < itinerarySlots.value.length; i += 1) {
-    const slot = itinerarySlots.value[i];
-    if (!slot.label.trim()) return `第 ${i + 1} 个时段名称不能为空`;
-    if ((slot.startMinute === null) !== (slot.endMinute === null)) return `第 ${i + 1} 个时段时间需同时填写开始和结束`;
-    if (slot.startMinute !== null && slot.endMinute !== null) {
-      if (slot.startMinute < 0 || slot.endMinute > 1440 || slot.startMinute >= slot.endMinute) {
-        return `第 ${i + 1} 个时段时间非法`;
+  for (let dayIndex = 1; dayIndex <= planDays.value; dayIndex += 1) {
+    const daySlots = itinerarySlots.value.filter((slot) => slot.dayIndex === dayIndex);
+    if (daySlots.length === 0) return `第 ${dayIndex} 天至少保留一个时段`;
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let i = 0; i < daySlots.length; i += 1) {
+      const slot = daySlots[i];
+      if (!slot.label.trim()) return `第 ${dayIndex} 天第 ${i + 1} 个时段名称不能为空`;
+      if ((slot.startMinute === null) !== (slot.endMinute === null)) return `第 ${dayIndex} 天第 ${i + 1} 个时段时间需同时填写开始和结束`;
+      if (slot.startMinute !== null && slot.endMinute !== null) {
+        if (slot.startMinute < 0 || slot.endMinute > 1440 || slot.startMinute >= slot.endMinute) {
+          return `第 ${dayIndex} 天第 ${i + 1} 个时段时间非法`;
+        }
+        ranges.push({ start: slot.startMinute, end: slot.endMinute });
       }
-      ranges.push({ start: slot.startMinute, end: slot.endMinute });
     }
-  }
-  ranges.sort((a, b) => a.start - b.start);
-  for (let i = 1; i < ranges.length; i += 1) {
-    if (ranges[i].start < ranges[i - 1].end) return "已设置时间的时段之间不能重叠";
+    ranges.sort((a, b) => a.start - b.start);
+    for (let i = 1; i < ranges.length; i += 1) {
+      if (ranges[i].start < ranges[i - 1].end) return `第 ${dayIndex} 天已设置时间的时段之间不能重叠`;
+    }
   }
   return null;
 }
@@ -220,17 +271,29 @@ async function saveItinerary(): Promise<void> {
   }
   itinerarySaving.value = true;
   try {
+    const slotsForSave: ItineraryDraftSlot[] = [];
+    for (let dayIndex = 1; dayIndex <= planDays.value; dayIndex += 1) {
+      const daySlots = itinerarySlots.value.filter((slot) => slot.dayIndex === dayIndex);
+      daySlots.forEach((slot) => slotsForSave.push(slot));
+    }
     const payload: ItineraryUpdatePayload = {
-      slots: itinerarySlots.value.map((slot, index) => ({
-        id: slot.id,
-        label: slot.label.trim(),
-        start_minute: slot.startMinute,
-        end_minute: slot.endMinute,
-        sort_index: index,
-        note: slot.note.trim(),
-        place_ids: [...slot.placeIds],
-      })),
+      slots: [],
     };
+    for (let dayIndex = 1; dayIndex <= planDays.value; dayIndex += 1) {
+      const daySlots = slotsForSave.filter((slot) => slot.dayIndex === dayIndex);
+      daySlots.forEach((slot, index) => {
+        payload.slots.push({
+          id: slot.id,
+          day_index: dayIndex,
+          label: slot.label.trim(),
+          start_minute: slot.startMinute,
+          end_minute: slot.endMinute,
+          sort_index: index,
+          note: slot.note.trim(),
+          place_ids: [...slot.placeIds],
+        });
+      });
+    }
     const saved = await apiPut<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`, payload);
     initItineraryDraft(saved);
     itineraryTip.value = "时段行程已保存";
@@ -241,30 +304,36 @@ async function saveItinerary(): Promise<void> {
   }
 }
 function addItinerarySlot(): void {
-  itinerarySlots.value.push({
+  const daySlots = [...currentDaySlots.value];
+  daySlots.push({
     uid: newSlotUid(),
-    label: `时段 ${itinerarySlots.value.length + 1}`,
+    dayIndex: selectedDay.value,
+    label: `时段 ${daySlots.length + 1}`,
     startMinute: null,
     endMinute: null,
     note: "",
     placeIds: [],
     noteExpanded: true,
   });
+  replaceCurrentDaySlots(daySlots);
 }
 
 function removeItinerarySlot(uid: string): void {
-  itinerarySlots.value = itinerarySlots.value.filter((slot) => slot.uid !== uid);
+  const daySlots = currentDaySlots.value.filter((slot) => slot.uid !== uid);
+  if (daySlots.length === 0) return;
+  replaceCurrentDaySlots(daySlots);
 }
 
 function moveSlot(uid: string, direction: -1 | 1): void {
-  const index = itinerarySlots.value.findIndex((slot) => slot.uid === uid);
+  const daySlots = [...currentDaySlots.value];
+  const index = daySlots.findIndex((slot) => slot.uid === uid);
   if (index < 0) return;
   const target = index + direction;
-  if (target < 0 || target >= itinerarySlots.value.length) return;
-  const next = [...itinerarySlots.value];
+  if (target < 0 || target >= daySlots.length) return;
+  const next = [...daySlots];
   const [current] = next.splice(index, 1);
   next.splice(target, 0, current);
-  itinerarySlots.value = next;
+  replaceCurrentDaySlots(next);
 }
 
 function findPlaceInPlan(placeId: number): Place | null {
@@ -500,8 +569,8 @@ function renderAllPlaceMarkers(): void {
       locatePlace(place);
     });
     placeMarkerMap.set(place.id, marker);
-    mapInstance.add(marker);
   }
+  applyMapScopeSelection(mapScopeSelection.value);
 }
 
 type MapPickPayload = {
@@ -684,18 +753,16 @@ async function removePlace(placeId: number): Promise<void> {
   }
 }
 
-async function searchAndPick(): Promise<void> {
+async function performSearch(keyword: string): Promise<void> {
   searchError.value = null;
   searchResults.value = [];
-  const keyword = searchKeyword.value.trim();
   if (!keyword) {
-    searchError.value = "请输入地点关键词";
     return;
   }
   searchLoading.value = true;
   try {
     const candidates = await searchPoi(keyword);
-    searchResults.value = candidates;
+    searchResults.value = candidates.slice(0, 5);
     if (candidates.length === 0) {
       searchError.value = "未搜索到地点";
       return;
@@ -708,6 +775,76 @@ async function searchAndPick(): Promise<void> {
     searchLoading.value = false;
   }
 }
+
+function clearSearch(): void {
+  searchKeyword.value = "";
+  searchError.value = null;
+  searchResults.value = [];
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+}
+
+type PlaceJoinInfo = {
+  joined: boolean;
+  text: string;
+  dayOrder: number;
+  slotOrder: number;
+  placeOrder: number;
+};
+
+function slotPlanningOrder(a: ItineraryDraftSlot, b: ItineraryDraftSlot): number {
+  if (a.startMinute !== null && b.startMinute !== null) {
+    if (a.startMinute !== b.startMinute) return a.startMinute - b.startMinute;
+    if (a.endMinute !== null && b.endMinute !== null && a.endMinute !== b.endMinute) return a.endMinute - b.endMinute;
+  }
+  return 0;
+}
+
+const placeJoinInfoMap = computed(() => {
+  const map = new Map<number, PlaceJoinInfo>();
+  for (let day = 1; day <= planDays.value; day += 1) {
+    const daySlots = itinerarySlots.value
+      .filter((slot) => slot.dayIndex === day)
+      .sort(slotPlanningOrder);
+    daySlots.forEach((slot, slotOrder) => {
+      slot.placeIds.forEach((placeId, placeOrder) => {
+        if (map.has(placeId)) return;
+        map.set(placeId, {
+          joined: true,
+          text: `已加入（${dayDateText(day)} ${slot.label}）`,
+          dayOrder: day,
+          slotOrder,
+          placeOrder,
+        });
+      });
+    });
+  }
+  return map;
+});
+
+function placeJoinText(placeId: number): string {
+  return placeJoinInfoMap.value.get(placeId)?.text ?? "未加入时段规划";
+}
+
+const sortedPlanPlaces = computed(() => {
+  const orderMap = new Map<number, number>();
+  planPlaces.value.forEach((place, index) => orderMap.set(place.id, index));
+  return [...planPlaces.value].sort((a, b) => {
+    const infoA = placeJoinInfoMap.value.get(a.id);
+    const infoB = placeJoinInfoMap.value.get(b.id);
+    const joinedA = infoA?.joined ?? false;
+    const joinedB = infoB?.joined ?? false;
+    if (joinedA !== joinedB) return joinedA ? -1 : 1;
+    if (joinedA && joinedB) {
+      if (infoA!.dayOrder !== infoB!.dayOrder) return infoA!.dayOrder - infoB!.dayOrder;
+      if (infoA!.slotOrder !== infoB!.slotOrder) return infoA!.slotOrder - infoB!.slotOrder;
+      if (infoA!.placeOrder !== infoB!.placeOrder) return infoA!.placeOrder - infoB!.placeOrder;
+    }
+    return (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0);
+  });
+});
 
 function showPlanPlacesOnMap(): void {
   if (!mapInstance || planPlaces.value.length === 0) return;
@@ -771,6 +908,36 @@ function showAllHistoryPlacesOnMap(): void {
   ensureMapCenteredInViewport();
 }
 
+watch(searchKeyword, (value) => {
+  const keyword = value.trim();
+  searchError.value = null;
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+  if (!keyword) {
+    searchResults.value = [];
+    searchLoading.value = false;
+    return;
+  }
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = null;
+    void performSearch(keyword);
+  }, SEARCH_DEBOUNCE_MS);
+});
+
+watch(selectedDay, (day) => {
+  if (day < 1) {
+    selectedDay.value = 1;
+    return;
+  }
+  if (day > planDays.value) {
+    selectedDay.value = planDays.value;
+    return;
+  }
+  ensureDaySlots(day);
+});
+
 onMounted(async () => {
   await loadPlan();
   if (loadError.value) return;
@@ -782,6 +949,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
   if (mapInstance) {
     mapInstance.destroy();
     mapInstance = null;
@@ -869,8 +1040,8 @@ onBeforeUnmount(() => {
                 placeholder="搜索地点关键词，如：上海博物馆"
                 :disabled="searchLoading"
               />
-              <button type="button" class="btn primary" :disabled="searchLoading" @click="searchAndPick">
-                {{ searchLoading ? "搜索中..." : "搜索并自动选中" }}
+              <button type="button" class="btn clear" :disabled="searchLoading && !searchKeyword" @click="clearSearch">
+                ×
               </button>
             </div>
             <p v-if="searchError" class="error">{{ searchError }}</p>
@@ -882,8 +1053,7 @@ onBeforeUnmount(() => {
                 class="result-item"
                 @click="setPlaceDraft(candidate)"
               >
-                <strong>{{ candidate.name }}</strong>
-                <span>{{ candidate.address }}</span>
+                <span>{{ candidate.name }} - {{ candidate.address }}</span>
               </button>
             </div>
 
@@ -923,6 +1093,20 @@ onBeforeUnmount(() => {
               <div class="section-title-row">
                 <h3>时段行程</h3>
                 <div class="section-actions">
+                  <label class="day-count">
+                    规划天数
+                    <select :value="planDays" @change="setPlanDays(Number(($event.target as HTMLSelectElement).value))">
+                      <option v-for="day in 30" :key="`days-${day}`" :value="day">{{ day }} 天</option>
+                    </select>
+                  </label>
+                  <label class="day-count">
+                    当前天
+                    <select v-model.number="selectedDay">
+                      <option v-for="day in planDays" :key="`selected-day-${day}`" :value="day">
+                        第 {{ day }} 天（{{ dayDateText(day) }}）
+                      </option>
+                    </select>
+                  </label>
                   <button type="button" class="btn small" @click="addItinerarySlot">新增时段</button>
                   <button type="button" class="btn small primary" :disabled="itinerarySaving" @click="saveItinerary">
                     {{ itinerarySaving ? "保存中..." : "保存时段行程" }}
@@ -932,9 +1116,9 @@ onBeforeUnmount(() => {
               <p v-if="itineraryLoading" class="muted">时段行程加载中...</p>
               <p v-if="itineraryError" class="error">{{ itineraryError }}</p>
               <p v-if="itineraryTip" class="tip">{{ itineraryTip }}</p>
-              <p v-if="itinerarySlots.length === 0" class="muted">暂无时段，请新增后保存。</p>
+              <p v-if="currentDaySlots.length === 0" class="muted">当前天暂无时段，请新增后保存。</p>
               <ul v-else class="itinerary-list">
-                <li v-for="(slot, index) in itinerarySlots" :key="slot.uid" class="itinerary-item">
+                <li v-for="(slot, index) in currentDaySlots" :key="slot.uid" class="itinerary-item">
                   <div class="itinerary-head">
                     <button type="button" class="itinerary-main" @click="focusSlotOnMap(slot)">
                       <strong>{{ slotTimeDisplay(slot) }}</strong>
@@ -952,7 +1136,7 @@ onBeforeUnmount(() => {
                       <button
                         type="button"
                         class="btn small"
-                        :disabled="index === itinerarySlots.length - 1"
+                        :disabled="index === currentDaySlots.length - 1"
                         @click="moveSlot(slot.uid, 1)"
                       >
                         下移
@@ -960,7 +1144,7 @@ onBeforeUnmount(() => {
                       <button
                         type="button"
                         class="btn small danger"
-                        :disabled="itinerarySlots.length <= 1"
+                        :disabled="currentDaySlots.length <= 1"
                         @click="removeItinerarySlot(slot.uid)"
                       >
                         删除时段
@@ -1036,10 +1220,11 @@ onBeforeUnmount(() => {
                 <h3>当前规划地点（{{ planPlaces.length }}）</h3>
                 <p v-if="planPlaces.length === 0" class="muted">当前规划还没有地点，可在地图点击或搜索后加入。</p>
                 <ul v-else class="place-list">
-                  <li v-for="place in planPlaces" :key="place.id" class="place-item">
+                  <li v-for="place in sortedPlanPlaces" :key="place.id" class="place-item">
                     <button type="button" class="place-main" @click="locatePlace(place)">
                       <strong>{{ place.name }}</strong>
                       <span>{{ place.address }}</span>
+                      <span class="place-status">{{ placeJoinText(place.id) }}</span>
                     </button>
                     <div class="item-actions">
                       <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
@@ -1168,13 +1353,35 @@ h3 {
   border-radius: 8px;
   background: #fff;
   text-align: left;
-  display: grid;
-  gap: 4px;
   padding: 8px;
   cursor: pointer;
+  color: #6b7280;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .result-item:hover {
   border-color: #2563eb;
+}
+.btn.clear {
+  min-width: 36px;
+  padding: 8px 10px;
+  font-size: 18px;
+  line-height: 1;
+}
+.day-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #374151;
+  font-size: 12px;
+}
+.day-count select {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 4px 6px;
+  font: inherit;
 }
 .place-form {
   border: 1px solid #e5e7eb;
@@ -1249,6 +1456,10 @@ h3 {
 .place-main span {
   color: #6b7280;
   font-size: 13px;
+}
+.place-status {
+  color: #6b7280;
+  font-size: 12px;
 }
 .item-actions {
   display: flex;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import PlanForm from "../components/PlanForm.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
@@ -22,6 +22,8 @@ const searchKeyword = ref("");
 const searchLoading = ref(false);
 const searchError = ref<string | null>(null);
 const searchResults = ref<PlacePayload[]>([]);
+const SEARCH_DEBOUNCE_MS = 250;
+let searchDebounceTimer: number | null = null;
 const pendingPlaces = ref<PlacePayload[]>([]);
 const HOTSPOT_CLICK_SUPPRESS_MS = 300;
 let mapInstance: AMapMapLike | null = null;
@@ -182,18 +184,16 @@ function removePendingPlace(index: number): void {
   renderPendingPlaceMarkers();
 }
 
-async function searchAndPick(): Promise<void> {
+async function performSearch(keyword: string): Promise<void> {
   searchError.value = null;
   searchResults.value = [];
-  const keyword = searchKeyword.value.trim();
   if (!keyword) {
-    searchError.value = "请输入地点关键词";
     return;
   }
   searchLoading.value = true;
   try {
     const candidates = await searchPoi(keyword);
-    searchResults.value = candidates;
+    searchResults.value = candidates.slice(0, 5);
     if (candidates.length === 0) {
       searchError.value = "未搜索到地点";
       return;
@@ -205,6 +205,34 @@ async function searchAndPick(): Promise<void> {
     searchLoading.value = false;
   }
 }
+
+function clearSearch(): void {
+  searchKeyword.value = "";
+  searchError.value = null;
+  searchResults.value = [];
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+}
+
+watch(searchKeyword, (value) => {
+  const keyword = value.trim();
+  searchError.value = null;
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+  if (!keyword) {
+    searchResults.value = [];
+    searchLoading.value = false;
+    return;
+  }
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = null;
+    void performSearch(keyword);
+  }, SEARCH_DEBOUNCE_MS);
+});
 
 async function initMap(): Promise<void> {
   const keyError = await assertAmapKeyReady();
@@ -273,6 +301,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
   if (mapInstance) {
     mapInstance.destroy();
     mapInstance = null;
@@ -313,8 +345,8 @@ onBeforeUnmount(() => {
           placeholder="搜索地点关键词，如：上海虹桥国际机场"
           :disabled="searchLoading"
         />
-        <button type="button" class="btn primary" :disabled="searchLoading" @click="searchAndPick">
-          {{ searchLoading ? "搜索中..." : "搜索并自动选中" }}
+        <button type="button" class="btn clear" :disabled="searchLoading && !searchKeyword" @click="clearSearch">
+          ×
         </button>
       </div>
       <p v-if="searchError" class="error">{{ searchError }}</p>
@@ -327,8 +359,7 @@ onBeforeUnmount(() => {
           class="result-item"
           @click="setPlaceDraft(candidate)"
         >
-          <strong>{{ candidate.name }}</strong>
-          <span>{{ candidate.address }}</span>
+          <span>{{ candidate.name }} - {{ candidate.address }}</span>
         </button>
       </div>
 
@@ -432,13 +463,22 @@ h1 {
   border-radius: 8px;
   background: #fff;
   text-align: left;
-  display: grid;
-  gap: 4px;
   padding: 8px;
   cursor: pointer;
+  color: #6b7280;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .result-item:hover {
   border-color: #2563eb;
+}
+.btn.clear {
+  min-width: 36px;
+  padding: 8px 10px;
+  font-size: 18px;
+  line-height: 1;
 }
 .place-form {
   border: 1px solid #e5e7eb;

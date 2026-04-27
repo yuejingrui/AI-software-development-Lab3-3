@@ -95,15 +95,29 @@ const hasPlanDateForecast = computed(() => {
 });
 
 async function loadWeather(): Promise<void> {
+  if (!Number.isFinite(props.longitude) || !Number.isFinite(props.latitude)) {
+    weather.value = null;
+    loadError.value = "经纬度无效，无法加载天气";
+    return;
+  }
   loading.value = true;
   loadError.value = null;
-  try {
-    weather.value = await fetchWeatherByLocation(props.longitude, props.latitude);
-  } catch (e) {
-    weather.value = null;
-    loadError.value = e instanceof Error ? e.message : "天气加载失败";
-  } finally {
-    loading.value = false;
+  const maxRetry = 1;
+  for (let attempt = 0; attempt <= maxRetry; attempt += 1) {
+    try {
+      weather.value = await fetchWeatherByLocation(props.longitude, props.latitude);
+      loading.value = false;
+      return;
+    } catch (e) {
+      if (attempt < maxRetry) {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        continue;
+      }
+      weather.value = null;
+      loadError.value = e instanceof Error ? e.message : "天气加载失败";
+      loading.value = false;
+      return;
+    }
   }
 }
 
