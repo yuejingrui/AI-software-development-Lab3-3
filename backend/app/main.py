@@ -82,6 +82,7 @@ class PlaceData(BaseModel):
 
 class ItinerarySlotInput(BaseModel):
     id: int | None = None
+    day_index: int = Field(default=1, ge=1, le=30)
     label: str = Field(min_length=1, max_length=30)
     start_minute: int | None = Field(default=None, ge=0, le=1440)
     end_minute: int | None = Field(default=None, ge=0, le=1440)
@@ -107,6 +108,7 @@ class ItinerarySlotPlaceData(BaseModel):
 class ItinerarySlotData(BaseModel):
     id: int
     plan_id: int
+    day_index: int
     label: str
     start_minute: int | None
     end_minute: int | None
@@ -323,45 +325,49 @@ def _is_placeholder(value: str) -> bool:
 def _validate_itinerary_slots(slots: list[ItinerarySlotInput]) -> None:
     if not slots:
         return
-    has_custom_time = any(slot.start_minute is not None or slot.end_minute is not None for slot in slots)
-    if has_custom_time:
-        ranges: list[tuple[int, int]] = []
-        for index, slot in enumerate(slots):
-            if slot.start_minute is None or slot.end_minute is None:
-                raise AppError(
-                    code=ErrorCode.VALIDATION,
-                    message="自定义时段时，所有时段都必须填写开始与结束时间",
-                    http_status=422,
-                )
-            start_minute = slot.start_minute
-            end_minute = slot.end_minute
-            if start_minute < 0 or end_minute > 1440 or start_minute >= end_minute:
-                raise AppError(
-                    code=ErrorCode.VALIDATION,
-                    message=f"时段 {index + 1} 时间范围非法，必须满足 00:00 <= 开始 < 结束 <= 24:00",
-                    http_status=422,
-                )
-            ranges.append((start_minute, end_minute))
-        ranges.sort(key=lambda item: item[0])
-        for i in range(1, len(ranges)):
-            prev_end = ranges[i - 1][1]
-            curr_start = ranges[i][0]
-            if curr_start < prev_end:
-                raise AppError(code=ErrorCode.VALIDATION, message="自定义时段之间不能重叠", http_status=422)
+    slots_by_day: dict[int, list[ItinerarySlotInput]] = defaultdict(list)
     for slot in slots:
-        if not slot.label.strip():
-            raise AppError(code=ErrorCode.VALIDATION, message="时段名称不能为空", http_status=422)
-        if len(set(slot.place_ids)) != len(slot.place_ids):
-            raise AppError(code=ErrorCode.VALIDATION, message="同一时段不能重复分配同一地点", http_status=422)
+        slots_by_day[slot.day_index].append(slot)
 
+    for day_index, day_slots in slots_by_day.items():
+        has_custom_time = any(slot.start_minute is not None or slot.end_minute is not None for slot in day_slots)
+        if has_custom_time:
+            ranges: list[tuple[int, int]] = []
+            for index, slot in enumerate(day_slots):
+                if slot.start_minute is None or slot.end_minute is None:
+                    raise AppError(
+                        code=ErrorCode.VALIDATION,
+                        message=f"第 {day_index} 天存在自定义时段时，所有时段都必须填写开始与结束时间",
+                        http_status=422,
+                    )
+                start_minute = slot.start_minute
+                end_minute = slot.end_minute
+                if start_minute < 0 or end_minute > 1440 or start_minute >= end_minute:
+                    raise AppError(
+                        code=ErrorCode.VALIDATION,
+                        message=f"第 {day_index} 天时段 {index + 1} 时间范围非法，必须满足 00:00 <= 开始 < 结束 <= 24:00",
+                        http_status=422,
+                    )
+                ranges.append((start_minute, end_minute))
+            ranges.sort(key=lambda item: item[0])
+            for i in range(1, len(ranges)):
+                prev_end = ranges[i - 1][1]
+                curr_start = ranges[i][0]
+                if curr_start < prev_end:
+                    raise AppError(code=ErrorCode.VALIDATION, message=f"第 {day_index} 天的时段之间不能重叠", http_status=422)
+        for slot in day_slots:
+            if not slot.label.strip():
+                raise AppError(code=ErrorCode.VALIDATION, message="时段名称不能为空", http_status=422)
+            if len(set(slot.place_ids)) != len(slot.place_ids):
+                raise AppError(code=ErrorCode.VALIDATION, message="同一时段不能重复分配同一地点", http_status=422)
 
 def _sort_itinerary_slots(slots: list[ItinerarySlotData]) -> list[ItinerarySlotData]:
     if slots and all(slot.start_minute is not None and slot.end_minute is not None for slot in slots):
         return sorted(
             slots,
-            key=lambda slot: (slot.start_minute or 0, slot.end_minute or 0, slot.sort_index, slot.id),
+            key=lambda slot: (slot.day_index, slot.start_minute or 0, slot.end_minute or 0, slot.sort_index, slot.id),
         )
-    return sorted(slots, key=lambda slot: (slot.sort_index, slot.id))
+    return sorted(slots, key=lambda slot: (slot.day_index, slot.sort_index, slot.id))
 
 
 def _load_plan_itinerary(plan_id: int) -> list[ItinerarySlotData]:
@@ -371,7 +377,7 @@ def _load_plan_itinerary(plan_id: int) -> list[ItinerarySlotData]:
             SELECT *
             FROM itinerary_slots
             WHERE plan_id = ?
-            ORDER BY sort_index ASC, id ASC
+            ORDER BY day_index ASC, sort_index ASC, id ASC
             """.strip(),
             (plan_id,),
         ).fetchall()
@@ -407,6 +413,7 @@ def _load_plan_itinerary(plan_id: int) -> list[ItinerarySlotData]:
             ItinerarySlotData(
                 id=int(row["id"]),
                 plan_id=int(row["plan_id"]),
+                day_index=int(row["day_index"]) if row["day_index"] is not None else 1,
                 label=row["label"],
                 start_minute=row["start_minute"],
                 end_minute=row["end_minute"],
@@ -731,7 +738,7 @@ def _itinerary_context_text(slots: list[ItinerarySlotData]) -> str:
             slot_time = slot.label
         place_names = "、".join(place.name for place in slot.places) if slot.places else "未分配地点"
         note = slot.note.strip()
-        line = f"- {slot_time} {slot.label}：{place_names}"
+        line = f"- 第{slot.day_index}天 {slot_time} {slot.label}：{place_names}"
         if note:
             line += f"；备注：{note}"
         lines.append(line)
@@ -1133,18 +1140,19 @@ def create_app() -> FastAPI:
             )
             conn.execute("DELETE FROM itinerary_slots WHERE plan_id = ?", (plan_id,))
             now = _now_iso()
-            for sort_index, slot in enumerate(payload.slots):
+            for slot in payload.slots:
                 slot_cursor = conn.execute(
                     """
-                    INSERT INTO itinerary_slots (plan_id, label, start_minute, end_minute, sort_index, note, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO itinerary_slots (plan_id, day_index, label, start_minute, end_minute, sort_index, note, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """.strip(),
                     (
                         plan_id,
+                        slot.day_index,
                         slot.label.strip(),
                         slot.start_minute,
                         slot.end_minute,
-                        sort_index,
+                        slot.sort_index,
                         slot.note.strip(),
                         now,
                         now,
@@ -1213,7 +1221,7 @@ def create_app() -> FastAPI:
             {
                 "key": YourWebServiceKey,
                 "keywords": keyword,
-                "offset": "10",
+                "offset": "5",
                 "page": "1",
                 "extensions": "base",
             },

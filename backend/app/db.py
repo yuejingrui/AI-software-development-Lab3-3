@@ -66,6 +66,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS itinerary_slots (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               plan_id INTEGER NOT NULL,
+              day_index INTEGER NOT NULL DEFAULT 1,
               label TEXT NOT NULL,
               start_minute INTEGER NULL,
               end_minute INTEGER NULL,
@@ -113,6 +114,13 @@ def init_db() -> None:
             ON itinerary_slots (plan_id);
             """.strip()
         )
+        slot_columns = conn.execute("PRAGMA table_info(itinerary_slots)").fetchall()
+        slot_column_names = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in slot_columns
+        }
+        if "day_index" not in slot_column_names:
+            conn.execute("ALTER TABLE itinerary_slots ADD COLUMN day_index INTEGER NOT NULL DEFAULT 1;")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_itinerary_slot_places_slot_id
