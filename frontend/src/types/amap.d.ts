@@ -17,6 +17,8 @@ export type AMapMarkerLike = {
 export type AMapGlobal = {
   Map: new (container: string | HTMLElement, options: Record<string, unknown>) => AMapMapLike;
   Marker: new (options: Record<string, unknown>) => AMapMarkerLike;
+  Polyline: new (options: Record<string, unknown>) => unknown;
+  Text: new (options: Record<string, unknown>) => unknown;
   Pixel: new (x: number, y: number) => unknown;
 };
 

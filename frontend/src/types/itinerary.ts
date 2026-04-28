@@ -34,3 +34,33 @@ export type ItinerarySlotPayload = {
 export type ItineraryUpdatePayload = {
   slots: ItinerarySlotPayload[];
 };
+
+export type ItineraryRoutePoint = {
+  place_id: number;
+  name: string;
+  address: string;
+  longitude: number;
+  latitude: number;
+  day_index: number;
+  slot_id: number;
+  slot_label: string;
+  slot_order: number;
+  place_order: number;
+};
+
+export type ItineraryRouteLeg = {
+  from_place_id: number;
+  to_place_id: number;
+  preferred_mode: "walk" | "drive" | "transit";
+  distance_m: number;
+  display_text: string;
+  walking_duration_s: number | null;
+  driving_duration_s: number | null;
+  transit_duration_s: number | null;
+};
+
+export type ItineraryRouteData = {
+  day_index: number;
+  places: ItineraryRoutePoint[];
+  legs: ItineraryRouteLeg[];
+};

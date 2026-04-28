@@ -7,7 +7,7 @@ import WeatherSidebar from "../components/WeatherSidebar.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
-import type { ItinerarySlot, ItineraryUpdatePayload } from "../types/itinerary";
+import type { ItineraryRouteData, ItinerarySlot, ItineraryUpdatePayload } from "../types/itinerary";
 import type { Place, PlacePayload } from "../types/place";
 import type { Plan, PlanPayload } from "../types/plan";
 
@@ -47,6 +47,7 @@ const mapError = ref<string | null>(null);
 let mapInstance: AMapMapLike | null = null;
 let pickMarker: AMapMarkerLike | null = null;
 const placeMarkerMap = new Map<number, AMapMarkerLike>();
+let itineraryRouteOverlays: unknown[] = [];
 
 const placeDraft = reactive<PlacePayload>({
   name: "",
@@ -72,12 +73,16 @@ let lastHotspotClickAt = 0;
 
 const planPlaces = ref<Place[]>([]);
 const allPlaces = ref<Place[]>([]);
-const mapScopeSelection = ref<"plan" | "all" | null>(null);
+const mapScopeSelection = ref<"plan" | "all" | "day" | null>(null);
+const mapScopePlaceIds = ref<number[] | null>(null);
 const riskCheckVersion = ref(0);
 const itineraryLoading = ref(false);
 const itinerarySaving = ref(false);
 const itineraryError = ref<string | null>(null);
 const itineraryTip = ref<string | null>(null);
+const itineraryRouteLoading = ref(false);
+const itineraryRouteError = ref<string | null>(null);
+const itineraryRouteTip = ref<string | null>(null);
 const itinerarySlotPicker = reactive<Record<string, number | null>>({});
 let itinerarySlotIdSeed = 0;
 
@@ -96,6 +101,10 @@ type ItineraryDraftSlot = {
 const itinerarySlots = ref<ItineraryDraftSlot[]>([]);
 const planDays = ref(1);
 const selectedDay = ref(1);
+
+const currentDayRoutePlaceCount = computed(() => {
+  return currentDaySlots.value.reduce((count, slot) => count + slot.placeIds.length, 0);
+});
 
 function bumpRiskCheckVersion(): void {
   riskCheckVersion.value += 1;
@@ -229,6 +238,9 @@ async function loadItinerary(): Promise<void> {
   } catch (e) {
     itineraryError.value = e instanceof Error ? e.message : "加载时段行程失败";
   } finally {
+    clearItineraryRouteOverlays();
+    itineraryRouteTip.value = null;
+    itineraryRouteError.value = null;
     itineraryLoading.value = false;
   }
 }
@@ -297,6 +309,9 @@ async function saveItinerary(): Promise<void> {
     const saved = await apiPut<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`, payload);
     initItineraryDraft(saved);
     itineraryTip.value = "时段行程已保存";
+    clearItineraryRouteOverlays();
+    itineraryRouteTip.value = null;
+    itineraryRouteError.value = null;
   } catch (e) {
     itineraryError.value = e instanceof Error ? e.message : "保存时段行程失败";
   } finally {
@@ -509,6 +524,89 @@ function clearPlaceMarkers(): void {
   placeMarkerMap.clear();
 }
 
+function clearItineraryRouteOverlays(): void {
+  if (!mapInstance || itineraryRouteOverlays.length === 0) {
+    itineraryRouteOverlays = [];
+    return;
+  }
+  mapInstance.remove(itineraryRouteOverlays);
+  itineraryRouteOverlays = [];
+}
+
+function routeColorForMode(mode: "walk" | "drive" | "transit"): string {
+  if (mode === "walk") return "#2c9e6f";
+  if (mode === "drive") return "#1f67d6";
+  return "#d97706";
+}
+
+function routeLabelOffset(index: number): number {
+  return index % 2 === 0 ? -18 : 18;
+}
+
+function renderDayRoute(route: ItineraryRouteData): void {
+  const AMap = window.AMap;
+  if (!mapInstance || !AMap) return;
+  clearItineraryRouteOverlays();
+
+  const placeIds = route.places.map((place) => place.place_id);
+  applyMapScopeSelection("day", placeIds);
+
+  const scopedMarkers = placeIds
+    .map((placeId) => placeMarkerMap.get(placeId))
+    .filter((marker): marker is AMapMarkerLike => Boolean(marker));
+  if (scopedMarkers.length > 0) {
+    mapInstance.setFitView(scopedMarkers);
+  }
+
+  if (route.places.length < 2) {
+    itineraryRouteTip.value = route.places.length === 1 ? "当前天只有 1 个地点，已定位显示" : "当前天暂无可显示地点";
+    return;
+  }
+
+  const overlays: unknown[] = [];
+  route.legs.forEach((leg, index) => {
+    const origin = route.places[index];
+    const destination = route.places[index + 1];
+    if (!origin || !destination) return;
+    const color = routeColorForMode(leg.preferred_mode);
+    const line = new AMap.Polyline({
+      path: [
+        [origin.longitude, origin.latitude],
+        [destination.longitude, destination.latitude],
+      ],
+      strokeColor: color,
+      strokeWeight: 5,
+      strokeOpacity: 0.95,
+      lineJoin: "round",
+      lineCap: "round",
+      bubble: true,
+    });
+    const text = new AMap.Text({
+      text: leg.display_text,
+      position: [
+        (origin.longitude + destination.longitude) / 2,
+        (origin.latitude + destination.latitude) / 2,
+      ],
+      offset: new AMap.Pixel(0, routeLabelOffset(index)),
+      style: {
+        color: "#111827",
+        backgroundColor: "rgba(255, 255, 255, 0.96)",
+        border: `1px solid ${color}`,
+        borderRadius: "999px",
+        padding: "4px 10px",
+        fontSize: "12px",
+        whiteSpace: "nowrap",
+      },
+    });
+    overlays.push(line, text);
+  });
+
+  if (overlays.length > 0) {
+    mapInstance.add(overlays);
+    itineraryRouteOverlays = overlays;
+  }
+}
+
 function hidePickMarker(): void {
   if (!mapInstance || !pickMarker) return;
   mapInstance.remove(pickMarker);
@@ -701,6 +799,9 @@ async function loadPlaces(): Promise<void> {
       slot.placeIds = slot.placeIds.filter((placeId) => validIds.has(placeId));
     }
     renderAllPlaceMarkers();
+    clearItineraryRouteOverlays();
+    itineraryRouteTip.value = null;
+    itineraryRouteError.value = null;
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "加载地点失败";
   } finally {
@@ -848,6 +949,9 @@ const sortedPlanPlaces = computed(() => {
 
 function showPlanPlacesOnMap(): void {
   if (!mapInstance || planPlaces.value.length === 0) return;
+  clearItineraryRouteOverlays();
+  itineraryRouteTip.value = null;
+  itineraryRouteError.value = null;
   applyMapScopeSelection("plan");
   const overlays = planPlaces.value
     .map((place) => placeMarkerMap.get(place.id))
@@ -857,16 +961,47 @@ function showPlanPlacesOnMap(): void {
 
 function showAllPlacesOnMap(): void {
   if (!mapInstance || placeMarkerMap.size === 0) return;
+  clearItineraryRouteOverlays();
+  itineraryRouteTip.value = null;
+  itineraryRouteError.value = null;
   applyMapScopeSelection("all");
   mapInstance.setFitView([...placeMarkerMap.values()]);
 }
 
+async function showSelectedDayPlacesOnMap(): Promise<void> {
+  if (!mapInstance || planId.value === null) return;
+  itineraryRouteLoading.value = true;
+  itineraryRouteError.value = null;
+  itineraryRouteTip.value = null;
+  clearItineraryRouteOverlays();
+  try {
+    const route = await apiGet<ItineraryRouteData>(`/plans/${planId.value}/itinerary/day-route?day_index=${selectedDay.value}`);
+    renderDayRoute(route);
+    if (route.places.length === 0) {
+      itineraryRouteTip.value = `第 ${selectedDay.value} 天暂无可显示地点`;
+      return;
+    }
+    if (route.places.length === 1) {
+      return;
+    }
+    itineraryRouteTip.value = `已显示第 ${selectedDay.value} 天地点行程图`;
+  } catch (e) {
+    itineraryRouteError.value = e instanceof Error ? e.message : "加载当日行程图失败";
+  } finally {
+    itineraryRouteLoading.value = false;
+  }
+}
+
 function clearMapScopeSelection(): void {
+  clearItineraryRouteOverlays();
+  itineraryRouteTip.value = null;
+  itineraryRouteError.value = null;
   applyMapScopeSelection(null);
 }
 
-function applyMapScopeSelection(scope: "plan" | "all" | null): void {
+function applyMapScopeSelection(scope: "plan" | "all" | "day" | null, placeIds: number[] | null = null): void {
   mapScopeSelection.value = scope;
+  mapScopePlaceIds.value = scope === "day" ? placeIds : null;
   if (!mapInstance) return;
   if (placeMarkerMap.size > 0) {
     mapInstance.remove([...placeMarkerMap.values()]);
@@ -881,6 +1016,15 @@ function applyMapScopeSelection(scope: "plan" | "all" | null): void {
       .filter((v): v is AMapMarkerLike => Boolean(v));
     if (planMarkers.length > 0) {
       mapInstance.add(planMarkers);
+    }
+    return;
+  }
+  if (scope === "day") {
+    const dayMarkers = (placeIds ?? mapScopePlaceIds.value ?? [])
+      .map((placeId) => placeMarkerMap.get(placeId))
+      .filter((v): v is AMapMarkerLike => Boolean(v));
+    if (dayMarkers.length > 0) {
+      mapInstance.add(dayMarkers);
     }
   }
 }
@@ -935,6 +1079,9 @@ watch(selectedDay, (day) => {
     selectedDay.value = planDays.value;
     return;
   }
+  clearItineraryRouteOverlays();
+  itineraryRouteTip.value = null;
+  itineraryRouteError.value = null;
   ensureDaySlots(day);
 });
 
@@ -1009,6 +1156,15 @@ onBeforeUnmount(() => {
               @reset="reset"
             />
 
+            <div class="section-actions">
+              <label class="day-count">
+                行程天数
+                <select :value="planDays" @change="setPlanDays(Number(($event.target as HTMLSelectElement).value))">
+                  <option v-for="day in 30" :key="`days-${day}`" :value="day">{{ day }} 天</option>
+                </select>
+              </label>
+            </div>
+
             <p v-if="saveTip" class="tip">{{ saveTip }}</p>
             <p v-if="submitError" class="error">{{ submitError }}</p>
           </section>
@@ -1026,6 +1182,16 @@ onBeforeUnmount(() => {
                   @click="showPlanPlacesOnMap"
                 >
                   显示当前规划全部地点
+                </button>
+                <button
+                  type="button"
+                  class="btn"
+                  :class="{ active: mapScopeSelection === 'day' }"
+                  data-map-scope-button="true"
+                  :disabled="!mapReady || itineraryRouteLoading || currentDayRoutePlaceCount === 0"
+                  @click="showSelectedDayPlacesOnMap"
+                >
+                  {{ itineraryRouteLoading ? "加载当日路线中..." : "显示当日地点" }}
                 </button>
               </div>
             </div>
@@ -1094,16 +1260,10 @@ onBeforeUnmount(() => {
                 <h3>时段行程</h3>
                 <div class="section-actions">
                   <label class="day-count">
-                    规划天数
-                    <select :value="planDays" @change="setPlanDays(Number(($event.target as HTMLSelectElement).value))">
-                      <option v-for="day in 30" :key="`days-${day}`" :value="day">{{ day }} 天</option>
-                    </select>
-                  </label>
-                  <label class="day-count">
                     当前天
                     <select v-model.number="selectedDay">
                       <option v-for="day in planDays" :key="`selected-day-${day}`" :value="day">
-                        第 {{ day }} 天（{{ dayDateText(day) }}）
+                        第 {{ day }} 天
                       </option>
                     </select>
                   </label>
@@ -1116,6 +1276,9 @@ onBeforeUnmount(() => {
               <p v-if="itineraryLoading" class="muted">时段行程加载中...</p>
               <p v-if="itineraryError" class="error">{{ itineraryError }}</p>
               <p v-if="itineraryTip" class="tip">{{ itineraryTip }}</p>
+              <p v-if="itineraryRouteLoading" class="muted">当日行程图加载中...</p>
+              <p v-if="itineraryRouteError" class="error">{{ itineraryRouteError }}</p>
+              <p v-if="itineraryRouteTip" class="tip">{{ itineraryRouteTip }}</p>
               <p v-if="currentDaySlots.length === 0" class="muted">当前天暂无时段，请新增后保存。</p>
               <ul v-else class="itinerary-list">
                 <li v-for="(slot, index) in currentDaySlots" :key="slot.uid" class="itinerary-item">

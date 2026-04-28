@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections import defaultdict
@@ -115,6 +116,36 @@ class ItinerarySlotData(BaseModel):
     sort_index: int
     note: str
     places: list[ItinerarySlotPlaceData]
+
+
+class ItineraryRoutePointData(BaseModel):
+    place_id: int
+    name: str
+    address: str
+    longitude: float
+    latitude: float
+    day_index: int
+    slot_id: int
+    slot_label: str
+    slot_order: int
+    place_order: int
+
+
+class ItineraryRouteLegData(BaseModel):
+    from_place_id: int
+    to_place_id: int
+    preferred_mode: Literal["walk", "drive", "transit"]
+    distance_m: float
+    display_text: str
+    walking_duration_s: float | None = None
+    driving_duration_s: float | None = None
+    transit_duration_s: float | None = None
+
+
+class ItineraryRouteData(BaseModel):
+    day_index: int
+    places: list[ItineraryRoutePointData]
+    legs: list[ItineraryRouteLegData]
 
 
 class MapConfigData(BaseModel):
@@ -368,6 +399,194 @@ def _sort_itinerary_slots(slots: list[ItinerarySlotData]) -> list[ItinerarySlotD
             key=lambda slot: (slot.day_index, slot.start_minute or 0, slot.end_minute or 0, slot.sort_index, slot.id),
         )
     return sorted(slots, key=lambda slot: (slot.day_index, slot.sort_index, slot.id))
+
+
+def _sort_day_slots_for_route(slots: list[ItinerarySlotData]) -> list[ItinerarySlotData]:
+    if slots and all(slot.start_minute is not None and slot.end_minute is not None for slot in slots):
+        return sorted(
+            slots,
+            key=lambda slot: (slot.start_minute or 0, slot.end_minute or 0, slot.sort_index, slot.id),
+        )
+    return sorted(slots, key=lambda slot: (slot.sort_index, slot.id))
+
+
+def _haversine_distance_m(origin_longitude: float, origin_latitude: float, destination_longitude: float, destination_latitude: float) -> float:
+    radius_m = 6371000.0
+    origin_lat_rad = math.radians(origin_latitude)
+    destination_lat_rad = math.radians(destination_latitude)
+    delta_lat = math.radians(destination_latitude - origin_latitude)
+    delta_lon = math.radians(destination_longitude - origin_longitude)
+    a = math.sin(delta_lat / 2) ** 2 + math.cos(origin_lat_rad) * math.cos(destination_lat_rad) * math.sin(delta_lon / 2) ** 2
+    return 2 * radius_m * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _format_duration_text(duration_seconds: float | None) -> str:
+    if duration_seconds is None or duration_seconds <= 0:
+        return "未知"
+    total_minutes = max(1, int(round(duration_seconds / 60)))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours} 小时 {minutes} 分钟"
+    if hours:
+        return f"{hours} 小时"
+    return f"{minutes} 分钟"
+
+
+def _extract_route_path_and_duration(body: dict[str, Any], route_key: str) -> tuple[float | None, float | None]:
+    route = body.get("route") or {}
+    items = route.get(route_key) or []
+    if not items:
+        return None, None
+    first = items[0] or {}
+    distance = _parse_float(first.get("distance"), 0.0)
+    duration = _parse_float(first.get("duration"), 0.0)
+    return distance, duration
+
+
+def _load_walking_route_summary(origin: PlaceData, destination: PlaceData) -> tuple[float | None, float | None]:
+    body = _amap_get(
+        "/v3/direction/walking",
+        {
+            "key": YourWebServiceKey,
+            "origin": f"{origin.longitude},{origin.latitude}",
+            "destination": f"{destination.longitude},{destination.latitude}",
+            "output": "JSON",
+        },
+    )
+    if body.get("status") != "1":
+        raise AppError(code=ErrorCode.HTTP, message=body.get("info", "步行路径规划失败"), http_status=502)
+    return _extract_route_path_and_duration(body, "paths")
+
+
+def _load_driving_route_summary(origin: PlaceData, destination: PlaceData) -> tuple[float | None, float | None]:
+    body = _amap_get(
+        "/v3/direction/driving",
+        {
+            "key": YourWebServiceKey,
+            "origin": f"{origin.longitude},{origin.latitude}",
+            "destination": f"{destination.longitude},{destination.latitude}",
+            "strategy": "2",
+            "output": "JSON",
+        },
+    )
+    if body.get("status") != "1":
+        raise AppError(code=ErrorCode.HTTP, message=body.get("info", "驾车路径规划失败"), http_status=502)
+    return _extract_route_path_and_duration(body, "paths")
+
+
+def _load_transit_route_summary(origin: PlaceData, destination: PlaceData) -> tuple[float | None, float | None]:
+    _, _, _, origin_adcode = _resolve_admin_by_location(origin.longitude, origin.latitude)
+    _, _, _, destination_adcode = _resolve_admin_by_location(destination.longitude, destination.latitude)
+    body = _amap_get(
+        "/v3/direction/transit/integrated",
+        {
+            "key": YourWebServiceKey,
+            "origin": f"{origin.longitude},{origin.latitude}",
+            "destination": f"{destination.longitude},{destination.latitude}",
+            "city": origin_adcode,
+            "cityd": destination_adcode or origin_adcode,
+            "extensions": "base",
+            "output": "JSON",
+        },
+    )
+    if body.get("status") != "1":
+        raise AppError(code=ErrorCode.HTTP, message=body.get("info", "公共交通路径规划失败"), http_status=502)
+    route = body.get("route") or {}
+    transits = route.get("transits") or []
+    if not transits:
+        return None, None
+    fastest = min(transits, key=lambda item: _parse_float((item or {}).get("duration"), float("inf")))
+    return _parse_float(fastest.get("distance"), 0.0), _parse_float(fastest.get("duration"), 0.0)
+
+
+def _build_route_leg(origin: PlaceData, destination: PlaceData) -> ItineraryRouteLegData:
+    straight_distance_m = _haversine_distance_m(origin.longitude, origin.latitude, destination.longitude, destination.latitude)
+    if straight_distance_m <= 1000:
+        walking_distance_m, walking_duration_s = _load_walking_route_summary(origin, destination)
+        effective_distance_m = walking_distance_m if walking_distance_m is not None else straight_distance_m
+        return ItineraryRouteLegData(
+            from_place_id=origin.id,
+            to_place_id=destination.id,
+            preferred_mode="walk",
+            distance_m=effective_distance_m,
+            display_text=f"步行约 {_format_duration_text(walking_duration_s)}",
+            walking_duration_s=walking_duration_s,
+        )
+
+    driving_distance_m, driving_duration_s = None, None
+    transit_distance_m, transit_duration_s = None, None
+    driving_error: AppError | None = None
+    transit_error: AppError | None = None
+    try:
+        driving_distance_m, driving_duration_s = _load_driving_route_summary(origin, destination)
+    except AppError as exc:
+        driving_error = exc
+    try:
+        transit_distance_m, transit_duration_s = _load_transit_route_summary(origin, destination)
+    except AppError as exc:
+        transit_error = exc
+
+    if driving_duration_s is None and transit_duration_s is None:
+        if driving_error is not None:
+            raise driving_error
+        if transit_error is not None:
+            raise transit_error
+        raise AppError(code=ErrorCode.HTTP, message="路径规划失败", http_status=502)
+
+    if transit_duration_s is None or (driving_duration_s is not None and driving_duration_s <= transit_duration_s):
+        preferred_mode = "drive"
+        effective_distance_m = driving_distance_m if driving_distance_m is not None else straight_distance_m
+    else:
+        preferred_mode = "transit"
+        effective_distance_m = transit_distance_m if transit_distance_m is not None else straight_distance_m
+
+    return ItineraryRouteLegData(
+        from_place_id=origin.id,
+        to_place_id=destination.id,
+        preferred_mode=preferred_mode,
+        distance_m=effective_distance_m,
+        display_text=" / ".join(
+            text
+            for text in (
+                f"驾车约 {_format_duration_text(driving_duration_s)}" if driving_duration_s is not None else "",
+                f"公交约 {_format_duration_text(transit_duration_s)}" if transit_duration_s is not None else "",
+            )
+            if text
+        ),
+        driving_duration_s=driving_duration_s,
+        transit_duration_s=transit_duration_s,
+    )
+
+
+def _load_plan_day_route(plan_id: int, day_index: int) -> ItineraryRouteData:
+    slots = [slot for slot in _load_plan_itinerary(plan_id) if slot.day_index == day_index]
+    day_slots = _sort_day_slots_for_route(slots)
+    ordered_places: list[ItineraryRoutePointData] = []
+    for slot_order, slot in enumerate(day_slots):
+        slot_places = sorted(slot.places, key=lambda item: (item.name.strip(), item.place_id))
+        for place_order, place in enumerate(slot_places):
+            ordered_places.append(
+                ItineraryRoutePointData(
+                    place_id=place.place_id,
+                    name=place.name,
+                    address=place.address,
+                    longitude=place.longitude,
+                    latitude=place.latitude,
+                    day_index=day_index,
+                    slot_id=slot.id,
+                    slot_label=slot.label,
+                    slot_order=slot_order,
+                    place_order=place_order,
+                )
+            )
+
+    legs: list[ItineraryRouteLegData] = []
+    for index in range(len(ordered_places) - 1):
+        origin = _load_place(ordered_places[index].place_id)
+        destination = _load_place(ordered_places[index + 1].place_id)
+        legs.append(_build_route_leg(origin, destination))
+
+    return ItineraryRouteData(day_index=day_index, places=ordered_places, legs=legs)
 
 
 def _load_plan_itinerary(plan_id: int) -> list[ItinerarySlotData]:
@@ -1170,6 +1389,13 @@ def create_app() -> FastAPI:
             conn.commit()
         _invalidate_plan_risk_check_cache(plan_id)
         return ok(_load_plan_itinerary(plan_id))
+
+    @app.get("/plans/{plan_id}/itinerary/day-route", response_model=ApiResponse[ItineraryRouteData])
+    def get_plan_itinerary_day_route(plan_id: int, day_index: int) -> ApiResponse[ItineraryRouteData]:
+        _ensure_plan_exists(plan_id)
+        if day_index < 1 or day_index > 30:
+            raise AppError(code=ErrorCode.VALIDATION, message="天数范围非法", http_status=422)
+        return ok(_load_plan_day_route(plan_id, day_index))
 
     @app.post("/plans/{plan_id}/ai-summary", response_model=ApiResponse[AiSummaryData])
     def plan_ai_summary(plan_id: int, payload: AiSummaryInput) -> ApiResponse[AiSummaryData]:
