@@ -15,14 +15,7 @@
         "common/db.js",
         "common/utils.js"
       ],
-      "envVariables": {
-        "APP_DB_PATH": "{{env.APP_DB_PATH}}",
-        "GLM_SECRET": "{{env.GLM_SECRET}}",
-        "GLM_API_KEY": "{{env.GLM_API_KEY}}",
-        "AMAP_JS_KEY": "{{env.AMAP_JS_KEY}}",
-        "AMAP_SECURITY_JS_CODE": "{{env.AMAP_SECURITY_JS_CODE}}",
-        "AMAP_WEB_SERVICE_KEY": "{{env.AMAP_WEB_SERVICE_KEY}}"
-      }
+      "envVariables": {}
     }
   ]
 }

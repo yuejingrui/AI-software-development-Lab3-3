@@ -61,6 +61,8 @@ const placeLoading = ref(false);
 const placeError = ref<string | null>(null);
 const placeTip = ref<string | null>(null);
 const editingPlaceId = ref<number | null>(null);
+let loadPlacesRequestSeq = 0;
+const deletingPlaceIds = ref<Set<number>>(new Set());
 
 const searchKeyword = ref("");
 const searchLoading = ref(false);
@@ -397,7 +399,7 @@ async function assignCurrentPickToSlot(slotUid: string): Promise<void> {
   try {
     if (!place) {
       place = await apiPost<Place>(`/plans/${planId.value}/places`, payload);
-      await loadPlaces();
+      upsertPlaceInLists(place);
     }
     addPlaceToSlot(slotUid, place.id);
     itineraryTip.value = "已将当前选中地点分配到时段";
@@ -757,6 +759,7 @@ async function initMap(): Promise<void> {
 }
 
 function setPlaceDraft(place: PlacePayload, showPickMarker = true): void {
+  editingPlaceId.value = null;
   placeDraft.name = place.name;
   placeDraft.address = place.address;
   placeDraft.longitude = place.longitude;
@@ -764,27 +767,57 @@ function setPlaceDraft(place: PlacePayload, showPickMarker = true): void {
   centerToPlace(placeDraft, 14, showPickMarker);
 }
 
-function resetPlaceForm(): void {
+function resetPlaceForm(clearTip = true): void {
   placeErrors.value = {};
   editingPlaceId.value = null;
   placeDraft.name = "";
   placeDraft.address = "";
-  placeTip.value = null;
+  if (clearTip) placeTip.value = null;
+}
+
+function upsertPlaceInLists(place: Place): void {
+  const planIndex = planPlaces.value.findIndex((item) => item.id === place.id);
+  if (planIndex >= 0) {
+    planPlaces.value.splice(planIndex, 1, place);
+  } else {
+    planPlaces.value = [place, ...planPlaces.value];
+  }
+  const allIndex = allPlaces.value.findIndex((item) => item.id === place.id);
+  if (allIndex >= 0) {
+    allPlaces.value.splice(allIndex, 1, place);
+  } else {
+    allPlaces.value = [place, ...allPlaces.value];
+  }
+  renderAllPlaceMarkers();
+}
+
+function removePlaceFromLists(placeId: number): void {
+  planPlaces.value = planPlaces.value.filter((item) => item.id !== placeId);
+  allPlaces.value = allPlaces.value.filter((item) => item.id !== placeId);
+  itinerarySlots.value = itinerarySlots.value.map((slot) => ({
+    ...slot,
+    placeIds: slot.placeIds.filter((id) => id !== placeId),
+  }));
+  renderAllPlaceMarkers();
+  clearItineraryRouteOverlays();
+  itineraryRouteTip.value = null;
+  itineraryRouteError.value = null;
 }
 
 function startEditPlace(place: Place): void {
-  editingPlaceId.value = place.id;
   setPlaceDraft({
     name: place.name,
     address: place.address,
     longitude: place.longitude,
     latitude: place.latitude,
   }, false);
+  editingPlaceId.value = place.id;
   placeTip.value = `正在编辑地点 #${place.id}`;
 }
 
 async function loadPlaces(): Promise<void> {
   if (planId.value === null) return;
+  const requestSeq = ++loadPlacesRequestSeq;
   placeLoading.value = true;
   placeError.value = null;
   try {
@@ -792,24 +825,29 @@ async function loadPlaces(): Promise<void> {
       apiGet<Place[]>(`/plans/${planId.value}/places`),
       apiGet<Place[]>("/places"),
     ]);
+    if (requestSeq !== loadPlacesRequestSeq) return;
     planPlaces.value = inPlan;
     allPlaces.value = all;
     const validIds = new Set(inPlan.map((item) => item.id));
-    for (const slot of itinerarySlots.value) {
-      slot.placeIds = slot.placeIds.filter((placeId) => validIds.has(placeId));
-    }
+    itinerarySlots.value = itinerarySlots.value.map((slot) => ({
+      ...slot,
+      placeIds: slot.placeIds.filter((placeId) => validIds.has(placeId)),
+    }));
     renderAllPlaceMarkers();
     clearItineraryRouteOverlays();
     itineraryRouteTip.value = null;
     itineraryRouteError.value = null;
   } catch (e) {
+    if (requestSeq !== loadPlacesRequestSeq) return;
     placeError.value = e instanceof Error ? e.message : "加载地点失败";
   } finally {
+    if (requestSeq !== loadPlacesRequestSeq) return;
     placeLoading.value = false;
   }
 }
 
 async function submitPlace(): Promise<void> {
+  if (placeDeleting.value) return;
   if (planId.value === null) {
     placeError.value = "规划 ID 不存在";
     return;
@@ -821,15 +859,16 @@ async function submitPlace(): Promise<void> {
   placeSaving.value = true;
   try {
     if (editingPlaceId.value === null) {
-      await apiPost<Place>(`/plans/${planId.value}/places`, payload);
+      const created = await apiPost<Place>(`/plans/${planId.value}/places`, payload);
+      upsertPlaceInLists(created);
       placeTip.value = "地点已加入当前规划";
     } else {
-      await apiPut<Place>(`/places/${editingPlaceId.value}`, payload);
+      const updated = await apiPut<Place>(`/places/${editingPlaceId.value}`, payload);
+      upsertPlaceInLists(updated);
       placeTip.value = "地点修改成功";
     }
-    await loadPlaces();
     bumpRiskCheckVersion();
-    resetPlaceForm();
+    resetPlaceForm(false);
   } catch (e) {
     placeError.value = e instanceof Error ? e.message : "保存地点失败";
   } finally {
@@ -837,20 +876,41 @@ async function submitPlace(): Promise<void> {
   }
 }
 
+const placeDeleting = ref(false);
+
 async function removePlace(placeId: number): Promise<void> {
+  if (placeDeleting.value || placeSaving.value || deletingPlaceIds.value.has(placeId)) return;
+  if (!planPlaces.value.some((p) => p.id === placeId)) {
+    placeTip.value = "该地点已被删除";
+    return;
+  }
   placeError.value = null;
   placeTip.value = null;
+  placeDeleting.value = true;
+  deletingPlaceIds.value.add(placeId);
+  removePlaceFromLists(placeId);
   try {
     await apiDelete<{ deleted: boolean }>(`/places/${placeId}`);
     if (editingPlaceId.value === placeId) {
       resetPlaceForm();
     }
-    await loadPlaces();
-    await loadItinerary();
     bumpRiskCheckVersion();
     placeTip.value = "地点已删除";
   } catch (e) {
-    placeError.value = e instanceof Error ? e.message : "删除地点失败";
+    const message = e instanceof Error ? e.message : "删除地点失败";
+    if (message.includes("地点不存在")) {
+      if (editingPlaceId.value === placeId) {
+        resetPlaceForm();
+      }
+      bumpRiskCheckVersion();
+      placeTip.value = "地点已删除";
+      return;
+    }
+    await loadPlaces();
+    placeError.value = message;
+  } finally {
+    deletingPlaceIds.value.delete(placeId);
+    placeDeleting.value = false;
   }
 }
 
@@ -1119,7 +1179,11 @@ onBeforeUnmount(() => {
 
     <section v-else-if="loadError" class="card">
       <p class="error">{{ loadError }}</p>
-      <button type="button" class="btn" @click="loadPlan">重试</button>
+      <div class="actions">
+        <button type="button" class="btn" @click="loadPlan">重试</button>
+        <RouterLink class="btn" to="/plans">返回列表</RouterLink>
+        <RouterLink class="btn primary" to="/plans/new">新建规划</RouterLink>
+      </div>
     </section>
 
     <template v-else>
@@ -1247,7 +1311,7 @@ onBeforeUnmount(() => {
                         : `保存地点 #${editingPlaceId} 修改`
                   }}
                 </button>
-                <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm">取消编辑</button>
+                <button type="button" class="btn" :disabled="placeSaving" @click="resetPlaceForm()">取消编辑</button>
               </div>
             </form>
 
@@ -1391,7 +1455,7 @@ onBeforeUnmount(() => {
                     </button>
                     <div class="item-actions">
                       <button type="button" class="btn small" @click="startEditPlace(place)">编辑</button>
-                      <button type="button" class="btn small danger" @click="removePlace(place.id)">删除</button>
+                      <button type="button" class="btn small danger" :disabled="placeDeleting || placeSaving || deletingPlaceIds.has(place.id)" @click="removePlace(place.id)">删除</button>
                     </div>
                   </li>
                 </ul>
