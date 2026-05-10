@@ -1,11 +1,11 @@
-import { createRouter, createWebHistory } from "vue-router";
+import { createRouter, createWebHashHistory } from "vue-router";
 import HealthView from "./views/HealthView.vue";
 import PlanCreateView from "./views/PlanCreateView.vue";
 import PlanDetailView from "./views/PlanDetailView.vue";
 import PlansListView from "./views/PlansListView.vue";
 
 export const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHashHistory(),
   routes: [
     { path: "/", redirect: "/plans/new" },
     { path: "/plans", name: "plans-list", component: PlansListView },

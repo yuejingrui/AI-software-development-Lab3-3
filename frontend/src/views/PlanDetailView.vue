@@ -6,6 +6,7 @@ import AiSummaryPanel from "../components/AiSummaryPanel.vue";
 import WeatherSidebar from "../components/WeatherSidebar.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiDelete, apiGet, apiPost, apiPut } from "../lib/api";
+import { setGlobalError } from "../stores/error";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
 import type { ItineraryRouteData, ItinerarySlot, ItineraryUpdatePayload } from "../types/itinerary";
 import type { Place, PlacePayload } from "../types/place";
@@ -235,10 +236,15 @@ async function loadItinerary(): Promise<void> {
   itineraryLoading.value = true;
   itineraryError.value = null;
   try {
-    const data = await apiGet<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`);
+    const data = await withPlanSyncRetry(
+      () => apiGet<ItinerarySlot[]>(`/plans/${planId.value}/itinerary`, { silent: true }),
+      8,
+      180
+    );
     initItineraryDraft(data);
   } catch (e) {
-    itineraryError.value = e instanceof Error ? e.message : "加载时段行程失败";
+    const message = e instanceof Error ? e.message : "加载时段行程失败";
+    itineraryError.value = isPlanNotFoundMessage(message) ? "规划同步中，请稍后重试时段加载" : message;
   } finally {
     clearItineraryRouteOverlays();
     itineraryRouteTip.value = null;
@@ -464,6 +470,27 @@ function parsePlanId(): number {
   return parsed;
 }
 
+function isPlanNotFoundMessage(message: string): boolean {
+  return message.includes("规划不存在");
+}
+
+async function withPlanSyncRetry<T>(request: () => Promise<T>, attempts = 8, delayMs = 180): Promise<T> {
+  let lastError: unknown = null;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await request();
+    } catch (e) {
+      lastError = e;
+      const message = e instanceof Error ? e.message : "";
+      if (!isPlanNotFoundMessage(message) || i >= attempts - 1) {
+        throw e;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("请求失败");
+}
+
 async function loadPlan(): Promise<void> {
   loading.value = true;
   loadError.value = null;
@@ -472,12 +499,27 @@ async function loadPlan(): Promise<void> {
   try {
     const id = parsePlanId();
     planId.value = id;
-    const plan = await apiGet<Plan>(`/plans/${id}`);
+    let plan: Plan | null = null;
+    const maxAttempts = 6;
+    for (let i = 0; i < maxAttempts; i += 1) {
+      try {
+        plan = await apiGet<Plan>(`/plans/${id}`, { silent: true });
+        break;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : "";
+        if (!message.includes("规划不存在")) throw e;
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+      }
+    }
+    if (!plan) {
+      throw new Error("规划已创建，但云端同步较慢，请稍后重试");
+    }
     const payload = toPayload(plan);
     applyPayload(draft, payload);
     applyPayload(lastSaved, payload);
     createdAt.value = plan.created_at;
     updatedAt.value = plan.updated_at;
+    setGlobalError(null);
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : "加载规划失败";
   } finally {
@@ -822,8 +864,8 @@ async function loadPlaces(): Promise<void> {
   placeError.value = null;
   try {
     const [inPlan, all] = await Promise.all([
-      apiGet<Place[]>(`/plans/${planId.value}/places`),
-      apiGet<Place[]>("/places"),
+      withPlanSyncRetry(() => apiGet<Place[]>(`/plans/${planId.value}/places`, { silent: true }), 8, 180),
+      apiGet<Place[]>("/places", { silent: true }),
     ]);
     if (requestSeq !== loadPlacesRequestSeq) return;
     planPlaces.value = inPlan;
@@ -839,7 +881,8 @@ async function loadPlaces(): Promise<void> {
     itineraryRouteError.value = null;
   } catch (e) {
     if (requestSeq !== loadPlacesRequestSeq) return;
-    placeError.value = e instanceof Error ? e.message : "加载地点失败";
+    const message = e instanceof Error ? e.message : "加载地点失败";
+    placeError.value = isPlanNotFoundMessage(message) ? "规划同步中，请稍后重试地点加载" : message;
   } finally {
     if (requestSeq !== loadPlacesRequestSeq) return;
     placeLoading.value = false;
@@ -1035,7 +1078,11 @@ async function showSelectedDayPlacesOnMap(): Promise<void> {
   itineraryRouteTip.value = null;
   clearItineraryRouteOverlays();
   try {
-    const route = await apiGet<ItineraryRouteData>(`/plans/${planId.value}/itinerary/day-route?day_index=${selectedDay.value}`);
+    const route = await withPlanSyncRetry(
+      () => apiGet<ItineraryRouteData>(`/plans/${planId.value}/itinerary/day-route?day_index=${selectedDay.value}`, { silent: true }),
+      8,
+      180
+    );
     renderDayRoute(route);
     if (route.places.length === 0) {
       itineraryRouteTip.value = `第 ${selectedDay.value} 天暂无可显示地点`;
@@ -1046,7 +1093,8 @@ async function showSelectedDayPlacesOnMap(): Promise<void> {
     }
     itineraryRouteTip.value = `已显示第 ${selectedDay.value} 天地点行程图`;
   } catch (e) {
-    itineraryRouteError.value = e instanceof Error ? e.message : "加载当日行程图失败";
+    const message = e instanceof Error ? e.message : "加载当日行程图失败";
+    itineraryRouteError.value = isPlanNotFoundMessage(message) ? "规划同步中，请稍后重试当日行程图" : message;
   } finally {
     itineraryRouteLoading.value = false;
   }

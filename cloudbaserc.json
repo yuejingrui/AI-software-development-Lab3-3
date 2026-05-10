@@ -8,13 +8,7 @@
       "timeout": 30,
       "runtime": "Nodejs18.15",
       "handler": "index.main",
-      "include": [
-        "common/errors.js",
-        "common/response.js",
-        "common/secrets.js",
-        "common/db.js",
-        "common/utils.js"
-      ],
+      "include": [],
       "envVariables": {}
     }
   ]

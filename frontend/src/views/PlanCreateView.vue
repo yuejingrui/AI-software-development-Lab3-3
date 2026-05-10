@@ -5,7 +5,7 @@ import PlanForm from "../components/PlanForm.vue";
 import { assertAmapKeyReady, loadAmapSdk, nearbyPoi, reverseGeocode, searchPoi } from "../lib/amap";
 import { apiPost } from "../lib/api";
 import type { AMapGlobal, AMapMapLike, AMapMarkerLike } from "../types/amap";
-import type { Place, PlacePayload } from "../types/place";
+import type { PlacePayload } from "../types/place";
 import type { Plan, PlanPayload } from "../types/plan";
 
 type FieldErrors = Partial<Record<keyof PlanPayload, string>>;
@@ -277,16 +277,16 @@ async function initMap(): Promise<void> {
 
 async function submit(): Promise<void> {
   submitError.value = null;
-  const payload: PlanPayload = { ...draft };
+  const payload: PlanPayload & { places?: PlacePayload[] } = { ...draft };
+  if (pendingPlaces.value.length > 0) {
+    payload.places = [...pendingPlaces.value];
+  }
   if (!validate(payload)) return;
   saving.value = true;
   try {
     const created = await apiPost<Plan>("/plans", payload);
-    if (pendingPlaces.value.length > 0) {
-      await Promise.all(
-        pendingPlaces.value.map((place) => apiPost<Place>(`/plans/${created.id}/places`, place))
-      );
-    }
+    // Do not block creation page on read-after-write retries.
+    // Detail page has its own retry strategy.
     await router.push(`/plans/${created.id}`);
   } catch (e) {
     submitError.value = e instanceof Error ? e.message : "创建失败";

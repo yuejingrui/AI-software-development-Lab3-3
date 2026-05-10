@@ -8,6 +8,7 @@ function getBaseUrl(): string {
 
 type ApiRequestOptions = {
   silent?: boolean;
+  timeoutMs?: number;
 };
 
 async function apiRequest<T>(
@@ -17,11 +18,15 @@ async function apiRequest<T>(
   options: ApiRequestOptions = {}
 ): Promise<T> {
   const url = `${getBaseUrl()}${path}`;
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const timeoutHandle = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
       body: payload === undefined ? undefined : JSON.stringify(payload),
+      signal: controller.signal,
     });
     const rawBody = await res.text();
     let parsedBody: ApiResponse<T> | null = null;
@@ -44,11 +49,18 @@ async function apiRequest<T>(
     }
     return parsedBody.data as T;
   } catch (e) {
-    const message = e instanceof Error ? e.message : "Network error";
+    const message =
+      e instanceof DOMException && e.name === "AbortError"
+        ? "请求超时，请稍后重试"
+        : e instanceof Error
+          ? e.message
+          : "Network error";
     if (!options.silent) {
       setGlobalError(message);
     }
     throw e;
+  } finally {
+    window.clearTimeout(timeoutHandle);
   }
 }
 

@@ -130,10 +130,27 @@ async function loadRiskCheck(): Promise<void> {
   riskLoading.value = true;
   riskLoadError.value = null;
   try {
-    riskCheck.value = await fetchPlanRiskCheck(props.planId);
+    const attempts = 6;
+    let loaded: PlanRiskCheck | null = null;
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        loaded = await fetchPlanRiskCheck(props.planId);
+        break;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : "";
+        const retryable = message.includes("规划不存在");
+        if (!retryable || i >= attempts - 1) throw e;
+        await new Promise((resolve) => window.setTimeout(resolve, 180));
+      }
+    }
+    if (!loaded) {
+      throw new Error("规划同步中，请稍后重试风险检查");
+    }
+    riskCheck.value = loaded;
   } catch (e) {
     riskCheck.value = null;
-    riskLoadError.value = e instanceof Error ? e.message : "规则检查失败";
+    const message = e instanceof Error ? e.message : "规则检查失败";
+    riskLoadError.value = message.includes("规划不存在") ? "规划同步中，请稍后重试风险检查" : message;
   } finally {
     riskLoading.value = false;
   }

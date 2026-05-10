@@ -82,31 +82,61 @@ function matchRoute(path) {
   return null;
 }
 
-function generatePlaceId() {
+function generateEntityId() {
   // Keep within JS safe integer range: ~1.7e15 in 2026, far below Number.MAX_SAFE_INTEGER.
   return Date.now() * 1000 + Math.floor(Math.random() * 1000);
 }
 
+function allocatePlanId(db) {
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = generateEntityId();
+    const exists = db.prepare("SELECT id FROM plans WHERE id = ?").get(candidate);
+    if (!exists) return candidate;
+  }
+  throw new AppError(ErrorCode.DB, "生成规划 ID 失败，请重试", 500);
+}
+
 function allocatePlaceId(db) {
   for (let i = 0; i < 8; i += 1) {
-    const candidate = generatePlaceId();
+    const candidate = generateEntityId();
     const exists = db.prepare("SELECT id FROM places WHERE id = ?").get(candidate);
     if (!exists) return candidate;
   }
   throw new AppError(ErrorCode.DB, "生成地点 ID 失败，请重试", 500);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryOnPlanNotFound(task) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await task();
+    } catch (e) {
+      const isPlanNotFound = e instanceof AppError && e.code === ErrorCode.NOT_FOUND && e.message === "规划不存在";
+      if (!isPlanNotFound) throw e;
+      if (attempt >= maxAttempts) throw e;
+      await ensureDb({ forceReload: true });
+      await sleep(120 * attempt);
+    }
+  }
+  throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function routeRequest(event) {
-  const { path, httpMethod, body: rawBody, queryStringParameters } = event;
+  const { path, httpMethod, body: rawBody, queryStringParameters, headers: reqHeaders } = event;
+  const origin = (reqHeaders && (reqHeaders.origin || reqHeaders.Origin)) || "";
   const params = queryStringParameters || {};
   const route = matchRoute(path);
 
   if (!route) {
     return {
       statusCode: 404,
-      headers: corsHeaders(),
+      headers: corsHeaders(origin),
       body: JSON.stringify(errorResponse(ErrorCode.NOT_FOUND, "Not Found")),
     };
   }
@@ -121,11 +151,11 @@ async function routeRequest(event) {
   // ── /health ─────────────────────────────────────────────────────
   if (route.handler === "health") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     const db = dbConn();
     db.prepare("SELECT 1").get();
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ status: "ok", db: "ok" })) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ status: "ok", db: "ok" })) };
   }
 
   // ── /plans (collection) ──────────────────────────────────────────
@@ -133,10 +163,12 @@ async function routeRequest(event) {
     if (httpMethod === "POST") {
       const now = nowIso();
       const db = dbConn();
-      const result = db.prepare(
-        `INSERT INTO plans (title, date, budget, people_count, preferences, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      const planId = allocatePlanId(db);
+      db.prepare(
+        `INSERT INTO plans (id, title, date, budget, people_count, preferences, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
+        planId,
         (payload.title || "").trim(),
         (payload.date || "").trim(),
         Number(payload.budget),
@@ -144,23 +176,40 @@ async function routeRequest(event) {
         (payload.preferences || "").trim(),
         now, now
       );
-      const row = db.prepare("SELECT * FROM plans WHERE id = ?").get(result.lastInsertRowid);
+      const row = db.prepare("SELECT * FROM plans WHERE id = ?").get(planId);
       if (!row) throw new AppError(ErrorCode.DB, "创建规划失败", 500);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(mapPlanRow(row))) };
+
+      // Support creating places together with the plan to avoid cross-instance DB sync delay
+      const places = payload.places || [];
+      const createdPlaces = [];
+      for (const place of places) {
+        const placeId = allocatePlaceId(db);
+        db.prepare(
+          `INSERT INTO places (id, plan_id, name, address, longitude, latitude, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(placeId, planId, (place.name || "").trim(), (place.address || "").trim(),
+          Number(place.longitude), Number(place.latitude), now, now);
+        createdPlaces.push(loadPlace(placeId));
+      }
+
+      const planData = mapPlanRow(row);
+      planData.places = createdPlaces;
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(planData)) };
     }
     if (httpMethod === "GET") {
       const db = dbConn();
       const rows = db.prepare("SELECT * FROM plans ORDER BY updated_at DESC, id DESC").all();
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(rows.map(mapPlanRow))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(rows.map(mapPlanRow))) };
     }
-    return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
   }
 
   // ── /plans/{plan_id} ─────────────────────────────────────────────
   if (route.handler === "plan_by_id") {
     const planId = route.plan_id;
     if (httpMethod === "GET") {
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlan(planId))) };
+      const data = await retryOnPlanNotFound(async () => loadPlan(planId));
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(data)) };
     }
     if (httpMethod === "PUT") {
       const now = nowIso();
@@ -176,16 +225,16 @@ async function routeRequest(event) {
       const row = db.prepare("SELECT * FROM plans WHERE id = ?").get(planId);
       if (!row) throw new AppError(ErrorCode.DB, "读取更新后规划失败", 500);
       invalidatePlanRiskCheckCache(planId);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(mapPlanRow(row))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(mapPlanRow(row))) };
     }
-    return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
   }
 
   // ── /plans/{plan_id}/places ──────────────────────────────────────
   if (route.handler === "plan_places") {
     const planId = route.plan_id;
     if (httpMethod === "POST") {
-      ensurePlanExists(planId);
+      await retryOnPlanNotFound(async () => ensurePlanExists(planId));
       const now = nowIso();
       const db = dbConn();
       const placeId = allocatePlaceId(db);
@@ -196,13 +245,16 @@ async function routeRequest(event) {
         Number(payload.longitude), Number(payload.latitude), now, now);
       invalidatePlanRiskCheckCache(planId);
       const createdId = Number(result.lastInsertRowid) || placeId;
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlace(createdId))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(loadPlace(createdId))) };
     }
     if (httpMethod === "GET") {
-      ensurePlanExists(planId);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlanPlaces(planId))) };
+      const data = await retryOnPlanNotFound(async () => {
+        ensurePlanExists(planId);
+        return loadPlanPlaces(planId);
+      });
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(data)) };
     }
-    return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
   }
 
   // ── /places, /places/{place_id} ──────────────────────────────────
@@ -215,10 +267,10 @@ async function routeRequest(event) {
          FROM places JOIN plans ON plans.id = places.plan_id
          ORDER BY places.updated_at DESC, places.id DESC`
       ).all();
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(rows.map(mapPlaceRow))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(rows.map(mapPlaceRow))) };
     }
     if (httpMethod === "GET" && placeId !== null) {
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlace(placeId))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(loadPlace(placeId))) };
     }
     if (httpMethod === "PUT" && placeId !== null) {
       const now = nowIso();
@@ -230,7 +282,7 @@ async function routeRequest(event) {
       if (result.changes === 0) throw new AppError(ErrorCode.NOT_FOUND, "地点不存在", 404);
       const place = loadPlace(placeId);
       invalidatePlanRiskCheckCache(place.plan_id);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(place)) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(place)) };
     }
     if (httpMethod === "DELETE" && placeId !== null) {
       const db = dbConn();
@@ -239,38 +291,41 @@ async function routeRequest(event) {
       const planId = row.plan_id;
       db.prepare("DELETE FROM places WHERE id = ?").run(placeId);
       invalidatePlanRiskCheckCache(planId);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ deleted: true })) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ deleted: true })) };
     }
-    return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
   }
 
   // ── /plans/{plan_id}/risk-check ──────────────────────────────────
   if (route.handler === "risk_check") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     const planId = route.plan_id;
     ensureMapConfigReady();
-    ensurePlanExists(planId);
+    await retryOnPlanNotFound(async () => ensurePlanExists(planId));
     const cached = loadPlanRiskCheckCache(planId);
-    if (cached) return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(cached)) };
-    const plan = loadPlan(planId);
+    if (cached) return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(cached)) };
+    const plan = await retryOnPlanNotFound(async () => loadPlan(planId));
     const places = loadPlanPlaces(planId);
     const weatherRisk = await evaluateWeatherRisk(plan, places);
     const result = { weather_risk: weatherRisk };
     savePlanRiskCheckCache(planId, result);
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(result)) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(result)) };
   }
 
   // ── /plans/{plan_id}/itinerary ───────────────────────────────────
   if (route.handler === "itinerary") {
     const planId = route.plan_id;
     if (httpMethod === "GET") {
-      ensurePlanExists(planId);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlanItinerary(planId))) };
+      const data = await retryOnPlanNotFound(async () => {
+        ensurePlanExists(planId);
+        return loadPlanItinerary(planId);
+      });
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(data)) };
     }
     if (httpMethod === "PUT") {
-      ensurePlanExists(planId);
+      await retryOnPlanNotFound(async () => ensurePlanExists(planId));
       const slots = payload.slots || [];
       validateItinerarySlots(slots);
       const placeIds = [...new Set(slots.flatMap((s) => s.place_ids || []))].sort((a, b) => a - b);
@@ -300,34 +355,34 @@ async function routeRequest(event) {
         }
       }
       invalidatePlanRiskCheckCache(planId);
-      return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(loadPlanItinerary(planId))) };
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(loadPlanItinerary(planId))) };
     }
-    return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
   }
 
   // ── /plans/{plan_id}/itinerary/day-route ─────────────────────────
   if (route.handler === "day_route") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     const planId = route.plan_id;
-    ensurePlanExists(planId);
+    await retryOnPlanNotFound(async () => ensurePlanExists(planId));
     const dayIndex = parseInt(params.day_index, 10);
     if (isNaN(dayIndex) || dayIndex < 1 || dayIndex > 30) {
       throw new AppError(ErrorCode.VALIDATION, "天数范围非法", 422);
     }
     const routeData = await loadPlanDayRoute(planId, dayIndex);
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(routeData)) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(routeData)) };
   }
 
   // ── /plans/{plan_id}/ai-summary ──────────────────────────────────
   if (route.handler === "ai_summary") {
     if (httpMethod !== "POST") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     const planId = route.plan_id;
-    ensurePlanExists(planId);
-    const plan = loadPlan(planId);
+    await retryOnPlanNotFound(async () => ensurePlanExists(planId));
+    const plan = await retryOnPlanNotFound(async () => loadPlan(planId));
     const places = loadPlanPlaces(planId);
     const itinerarySlots = loadPlanItinerary(planId);
     let result;
@@ -350,21 +405,21 @@ async function routeRequest(event) {
         };
       } else { throw e; }
     }
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(result)) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(result)) };
   }
 
   // ── /map/* ───────────────────────────────────────────────────────
   if (route.handler === "map_config") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     ensureMapConfigReady();
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ js_key: YourJsKey, security_js_code: YourSecurityJsCode })) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ js_key: YourJsKey, security_js_code: YourSecurityJsCode })) };
   }
 
   if (route.handler === "map_search") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     ensureMapConfigReady();
     const keyword = (params.keywords || "").trim();
@@ -380,12 +435,12 @@ async function routeRequest(event) {
       if (isNaN(lon) || isNaN(lat)) continue;
       data.push({ name: String(row.name || "未命名地点").trim(), address: String(row.address || "地址未知").trim(), longitude: lon, latitude: lat });
     }
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(data)) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(data)) };
   }
 
   if (route.handler === "map_reverse_geocode") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     ensureMapConfigReady();
     const lon = parseFloat(params.longitude), lat = parseFloat(params.latitude);
@@ -410,12 +465,12 @@ async function routeRequest(event) {
     if (!doorplate) doorplate = number || street;
     const name = poiName || buildingName || neighborhoodName || doorplate || formattedAddress || "未命名地点";
     const address = doorplate || poiAddress || formattedAddress || "地址未知";
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ name, address })) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ name, address })) };
   }
 
   if (route.handler === "map_nearby_poi") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     ensureMapConfigReady();
     const lon = parseFloat(params.longitude), lat = parseFloat(params.latitude);
@@ -423,20 +478,20 @@ async function routeRequest(event) {
     const body = await amapGet("/v3/place/around", { key: YourWebServiceKey, location: `${lon},${lat}`, radius: "120", offset: "1", page: "1", extensions: "base" });
     if (body.status !== "1") throw new AppError(ErrorCode.HTTP, body.info || "周边地点查询失败", 502);
     const pois = body.pois || [];
-    if (!pois.length) return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(null)) };
+    if (!pois.length) return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(null)) };
     const first = pois[0] || {};
     const location = String(first.location || "").trim();
     const parts = location.split(",");
-    if (parts.length !== 2) return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(null)) };
+    if (parts.length !== 2) return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(null)) };
     const poiLon = parseFloatSafe(parts[0], NaN), poiLat = parseFloatSafe(parts[1], NaN);
-    if (isNaN(poiLon) || isNaN(poiLat)) return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok(null)) };
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ name: String(first.name || "未命名地点").trim(), address: String(first.address || "地址未知").trim(), longitude: poiLon, latitude: poiLat })) };
+    if (isNaN(poiLon) || isNaN(poiLat)) return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(null)) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ name: String(first.name || "未命名地点").trim(), address: String(first.address || "地址未知").trim(), longitude: poiLon, latitude: poiLat })) };
   }
 
   // ── /weather/by-location ─────────────────────────────────────────
   if (route.handler === "weather") {
     if (httpMethod !== "GET") {
-      return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+      return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     }
     ensureMapConfigReady();
     const lon = parseFloat(params.longitude), lat = parseFloat(params.latitude);
@@ -456,17 +511,20 @@ async function routeRequest(event) {
       report_time: String(live.reporttime || "").trim(),
     };
     const forecast = await loadWeatherForecastByAdcode(adcode);
-    return { statusCode: 200, headers: corsHeaders(), body: JSON.stringify(ok({ province, city, district, adcode, current, forecast })) };
+    return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ province, city, district, adcode, current, forecast })) };
   }
 
-  return { statusCode: 405, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+  return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
 }
 
 exports.main = async (event, context) => {
   await ensureDb();
 
+  const reqHeaders = event.headers || {};
+  const origin = (reqHeaders.origin || reqHeaders.Origin) || "";
+
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: corsHeaders(), body: "" };
+    return { statusCode: 204, headers: corsHeaders(origin), body: "" };
   }
 
   let resp;
@@ -474,14 +532,17 @@ exports.main = async (event, context) => {
     resp = await routeRequest(event);
   } catch (e) {
     if (e instanceof AppError) {
-      resp = { statusCode: e.httpStatus, headers: corsHeaders(), body: JSON.stringify(errorResponse(e.code, e.message)) };
+      resp = { statusCode: e.httpStatus, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(e.code, e.message)) };
     } else if (e instanceof SyntaxError) {
-      resp = { statusCode: 422, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.VALIDATION, e.message)) };
+      resp = { statusCode: 422, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.VALIDATION, e.message)) };
     } else {
-      resp = { statusCode: 500, headers: corsHeaders(), body: JSON.stringify(errorResponse(ErrorCode.UNKNOWN, e.message)) };
+      resp = { statusCode: 500, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.UNKNOWN, e.message)) };
     }
   }
 
-  await finishBackups();
+  const method = String(event.httpMethod || "").toUpperCase();
+  const isWriteRequest = method === "POST" || method === "PUT" || method === "DELETE";
+  const isPlanCreate = method === "POST" && String(event.path || "") === "/plans";
+  await finishBackups(isPlanCreate ? 2500 : isWriteRequest ? 1200 : 0);
   return resp;
 };
