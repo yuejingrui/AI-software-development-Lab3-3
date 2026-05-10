@@ -19,7 +19,7 @@ async function apiRequest<T>(
 ): Promise<T> {
   const url = `${getBaseUrl()}${path}`;
   const controller = new AbortController();
-  const timeoutMs = options.timeoutMs ?? 15000;
+  const timeoutMs = options.timeoutMs ?? 30000;
   const timeoutHandle = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
@@ -58,7 +58,7 @@ async function apiRequest<T>(
     if (!options.silent) {
       setGlobalError(message);
     }
-    throw e;
+    throw new Error(message);
   } finally {
     window.clearTimeout(timeoutHandle);
   }

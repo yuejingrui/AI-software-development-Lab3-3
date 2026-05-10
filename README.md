@@ -111,7 +111,7 @@ Lab3-3/
 | `itinerary_slot_places` | 时段-地点关联表（多对多，含排序） |
 | `risk_check_cache` | 风险检查缓存表 |
 
-数据库使用 SQLite（sql.js WASM 实现），每次写操作后自动上传到 CloudBase 云存储作为持久化备份，冷启动时从云端恢复。
+数据库已迁移为 CloudBase 文档数据库（多实例共享一致数据），云函数直接对集合进行读写，不再依赖本地 SQLite 快照同步。
 
 ## 技术栈
 
@@ -122,7 +122,7 @@ Lab3-3/
 | 构建工具 | Vite 6 |
 | 地图 SDK | 高德地图 JS API 2.0 |
 | 后端运行时 | Node.js 18.15（CloudBase 云函数） |
-| 数据库 | SQLite（sql.js，WASM 内存运行 + 云端备份） |
+| 数据库 | CloudBase 文档数据库（共享持久化） |
 | AI 模型 | 智谱 GLM-4 Flash |
 | 联网检索 | DuckDuckGo Instant Answer API |
 | 部署平台 | 腾讯云 CloudBase（云函数 + 静态托管） |

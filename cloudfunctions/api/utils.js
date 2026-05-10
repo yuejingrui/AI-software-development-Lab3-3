@@ -2,8 +2,19 @@
 
 const https = require("https");
 const { URL } = require("url");
-const { dbConn } = require("./db");
 const { AppError, ErrorCode } = require("./errors");
+const {
+  COLLECTIONS,
+  findOneByField,
+  listByField,
+  listAll,
+  addDoc,
+  updateByField,
+  removeByField,
+  removeByFieldIn,
+  listByFieldIn,
+  nowIso: storeNowIso,
+} = require("./store");
 const {
   YourJsKey,
   YourSecurityJsCode,
@@ -15,7 +26,7 @@ const {
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function nowIso() {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, "");
+  return storeNowIso();
 }
 
 function isPlaceholder(value) {
@@ -72,58 +83,71 @@ function mapPlaceRow(row) {
 
 // ─── DB loaders ─────────────────────────────────────────────────────────────
 
-function ensurePlanExists(planId) {
-  const db = dbConn();
-  const row = db.prepare("SELECT id FROM plans WHERE id = ?").get(planId);
+async function ensurePlanExists(planId) {
+  const row = await findOneByField(COLLECTIONS.plans, "id", planId);
   if (!row) {
     throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
   }
 }
 
-function loadPlace(placeId) {
-  const db = dbConn();
-  const row = db
-    .prepare(
-      `SELECT places.*, plans.title AS plan_title
-       FROM places
-       JOIN plans ON plans.id = places.plan_id
-       WHERE places.id = ?`
-    )
-    .get(placeId);
+async function loadPlace(placeId) {
+  const row = await findOneByField(COLLECTIONS.places, "id", placeId);
   if (!row) {
     throw new AppError(ErrorCode.NOT_FOUND, "地点不存在", 404);
   }
-  return mapPlaceRow(row);
+  const plan = await findOneByField(COLLECTIONS.plans, "id", row.plan_id);
+  return mapPlaceRow({ ...row, plan_title: plan ? plan.title : null });
 }
 
-function loadPlan(planId) {
-  const db = dbConn();
-  const row = db.prepare("SELECT * FROM plans WHERE id = ?").get(planId);
+async function loadPlan(planId) {
+  const row = await findOneByField(COLLECTIONS.plans, "id", planId);
   if (!row) {
     throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
   }
   return mapPlanRow(row);
 }
 
-function loadPlanPlaces(planId) {
-  const db = dbConn();
-  const rows = db
-    .prepare(
-      `SELECT places.*, plans.title AS plan_title
-       FROM places
-       JOIN plans ON plans.id = places.plan_id
-       WHERE places.plan_id = ?
-       ORDER BY places.updated_at DESC, places.id DESC`
-    )
-    .all(planId);
-  return rows.map(mapPlaceRow);
+async function loadPlanPlaces(planId) {
+  const rows = await listByField(COLLECTIONS.places, "plan_id", planId);
+  rows.sort((a, b) => {
+    const keyA = `${a.updated_at || ""}#${a.id || 0}`;
+    const keyB = `${b.updated_at || ""}#${b.id || 0}`;
+    return keyA < keyB ? 1 : keyA > keyB ? -1 : 0;
+  });
+  const plan = await findOneByField(COLLECTIONS.plans, "id", planId);
+  const planTitle = plan ? plan.title : null;
+  const withTitle = rows.map((row) => ({ ...row, plan_title: planTitle }));
+  return withTitle.map(mapPlaceRow);
 }
 
-function loadPlanRiskCheckCache(planId) {
-  const db = dbConn();
-  const row = db
-    .prepare("SELECT payload_json FROM risk_check_cache WHERE plan_id = ?")
-    .get(planId);
+async function loadAllPlacesWithPlanTitle() {
+  const [places, plans] = await Promise.all([
+    listAll(COLLECTIONS.places),
+    listAll(COLLECTIONS.plans),
+  ]);
+  const planTitleById = new Map(plans.map((p) => [p.id, p.title]));
+  places.sort((a, b) => {
+    const keyA = `${a.updated_at || ""}#${a.id || 0}`;
+    const keyB = `${b.updated_at || ""}#${b.id || 0}`;
+    return keyA < keyB ? 1 : keyA > keyB ? -1 : 0;
+  });
+  return places.map((row) =>
+    mapPlaceRow({ ...row, plan_title: planTitleById.get(row.plan_id) || null })
+  );
+}
+
+async function loadPlansOrdered() {
+  const rows = await listAll(COLLECTIONS.plans);
+  rows.sort((a, b) => {
+    const keyA = `${a.updated_at || ""}#${a.id || 0}`;
+    const keyB = `${b.updated_at || ""}#${b.id || 0}`;
+    return keyA < keyB ? 1 : keyA > keyB ? -1 : 0;
+  });
+  return rows.map(mapPlanRow);
+}
+
+async function loadPlanRiskCheckCache(planId) {
+  const row = await findOneByField(COLLECTIONS.riskCheckCache, "plan_id", planId);
   if (!row) return null;
   const payloadJson = (row.payload_json || "").trim();
   if (!payloadJson) return null;
@@ -135,20 +159,24 @@ function loadPlanRiskCheckCache(planId) {
   }
 }
 
-function savePlanRiskCheckCache(planId, data) {
-  const db = dbConn();
-  db.prepare(
-    `INSERT INTO risk_check_cache (plan_id, payload_json, updated_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(plan_id) DO UPDATE SET
-       payload_json = excluded.payload_json,
-       updated_at = excluded.updated_at`
-  ).run(planId, JSON.stringify(data), nowIso());
+async function savePlanRiskCheckCache(planId, data) {
+  const existing = await findOneByField(COLLECTIONS.riskCheckCache, "plan_id", planId);
+  if (existing) {
+    await updateByField(COLLECTIONS.riskCheckCache, "plan_id", planId, {
+      payload_json: JSON.stringify(data),
+      updated_at: nowIso(),
+    });
+    return;
+  }
+  await addDoc(COLLECTIONS.riskCheckCache, {
+    plan_id: planId,
+    payload_json: JSON.stringify(data),
+    updated_at: nowIso(),
+  });
 }
 
-function invalidatePlanRiskCheckCache(planId) {
-  const db = dbConn();
-  db.prepare("DELETE FROM risk_check_cache WHERE plan_id = ?").run(planId);
+async function invalidatePlanRiskCheckCache(planId) {
+  await removeByField(COLLECTIONS.riskCheckCache, "plan_id", planId);
 }
 
 // ─── Itinerary helpers ──────────────────────────────────────────────────────
@@ -703,42 +731,39 @@ async function buildRouteLeg(origin, dest) {
 
 // ─── Itinerary loader ───────────────────────────────────────────────────────
 
-function loadPlanItinerary(planId) {
-  const db = dbConn();
-  const slotRows = db
-    .prepare(
-      `SELECT *
-       FROM itinerary_slots
-       WHERE plan_id = ?
-       ORDER BY day_index ASC, sort_index ASC, id ASC`
-    )
-    .all(planId);
+async function loadPlanItinerary(planId) {
+  const slotRows = await listByField(COLLECTIONS.itinerarySlots, "plan_id", planId);
+  slotRows.sort((a, b) => {
+    if ((a.day_index || 1) !== (b.day_index || 1)) return (a.day_index || 1) - (b.day_index || 1);
+    if ((a.sort_index || 0) !== (b.sort_index || 0)) return (a.sort_index || 0) - (b.sort_index || 0);
+    return (a.id || 0) - (b.id || 0);
+  });
   if (!slotRows.length) return [];
 
   const slotIds = slotRows.map((r) => r.id);
-  const placeholders = slotIds.map(() => "?").join(",");
-  const placeRows = db
-    .prepare(
-      `SELECT isp.id AS slot_place_id, isp.slot_id, isp.sort_index, p.*
-       FROM itinerary_slot_places AS isp
-       JOIN places AS p ON p.id = isp.place_id
-       WHERE isp.slot_id IN (${placeholders}) AND p.plan_id = ?
-       ORDER BY isp.sort_index ASC, isp.id ASC`
-    )
-    .all(...slotIds, planId);
+  const slotPlaceRows = await listByFieldIn(COLLECTIONS.itinerarySlotPlaces, "slot_id", slotIds);
+  slotPlaceRows.sort((a, b) => {
+    if ((a.sort_index || 0) !== (b.sort_index || 0)) return (a.sort_index || 0) - (b.sort_index || 0);
+    return (a.id || 0) - (b.id || 0);
+  });
+  const uniquePlaceIds = [...new Set(slotPlaceRows.map((r) => r.place_id))];
+  const placeRowsRaw = await listByFieldIn(COLLECTIONS.places, "id", uniquePlaceIds);
+  const placeById = new Map(placeRowsRaw.map((p) => [p.id, p]));
 
   const placesBySlot = {};
-  for (const row of placeRows) {
-    const sid = row.slot_id;
+  for (const link of slotPlaceRows) {
+    const placeRow = placeById.get(link.place_id);
+    if (!placeRow || placeRow.plan_id !== planId) continue;
+    const sid = link.slot_id;
     if (!placesBySlot[sid]) placesBySlot[sid] = [];
     placesBySlot[sid].push({
-      slot_place_id: row.slot_place_id,
-      sort_index: row.sort_index,
-      place_id: row.id,
-      name: row.name,
-      address: row.address,
-      longitude: row.longitude,
-      latitude: row.latitude,
+      slot_place_id: link.id,
+      sort_index: link.sort_index,
+      place_id: placeRow.id,
+      name: placeRow.name,
+      address: placeRow.address,
+      longitude: placeRow.longitude,
+      latitude: placeRow.latitude,
     });
   }
 
@@ -758,7 +783,7 @@ function loadPlanItinerary(planId) {
 }
 
 async function loadPlanDayRoute(planId, dayIndex) {
-  const allSlots = loadPlanItinerary(planId);
+  const allSlots = await loadPlanItinerary(planId);
   const daySlotsRaw = allSlots.filter((s) => s.day_index === dayIndex);
   const daySlots = sortDaySlotsForRoute(daySlotsRaw);
 
@@ -789,8 +814,8 @@ async function loadPlanDayRoute(planId, dayIndex) {
 
   const legs = [];
   for (let i = 0; i < orderedPlaces.length - 1; i++) {
-    const originPlace = loadPlace(orderedPlaces[i].place_id);
-    const destPlace = loadPlace(orderedPlaces[i + 1].place_id);
+    const originPlace = await loadPlace(orderedPlaces[i].place_id);
+    const destPlace = await loadPlace(orderedPlaces[i + 1].place_id);
     legs.push(await buildRouteLeg(originPlace, destPlace));
   }
 
@@ -1239,6 +1264,8 @@ module.exports = {
   loadPlace,
   loadPlan,
   loadPlanPlaces,
+  loadAllPlacesWithPlanTitle,
+  loadPlansOrdered,
   loadPlanRiskCheckCache,
   savePlanRiskCheckCache,
   invalidatePlanRiskCheckCache,

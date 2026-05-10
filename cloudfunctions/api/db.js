@@ -17,7 +17,7 @@ const STORAGE_BUCKET = "6c61-lab3-3-d5gdcm7qo10ced8af-1427379735";
 const ENV_ID = process.env.TCB_ENV_ID || "lab3-3-d5gdcm7qo10ced8af";
 const DB_FILE_ID = `cloud://${ENV_ID}.${STORAGE_BUCKET}/${DB_BACKUP_PATH}`;
 const DB_MANIFEST_FILE_ID = `cloud://${ENV_ID}.${STORAGE_BUCKET}/${DB_BACKUP_MANIFEST_PATH}`;
-const META_COLLECTION = "_lab33_meta";
+const META_COLLECTION = "lab33_meta";
 const META_DOC_ID = "sqlite_backup_meta";
 
 let _tcbApp = null;
@@ -69,7 +69,6 @@ async function getLatestBackupMeta(app) {
 async function saveLatestBackupMeta(app, cloudPath, fileID) {
   const db = app.database();
   const payload = {
-    _id: META_DOC_ID,
     cloud_path: cloudPath,
     file_id: fileID,
     updated_at: new Date().toISOString(),
