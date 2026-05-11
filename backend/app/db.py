@@ -114,6 +114,14 @@ def init_db() -> None:
             ON itinerary_slots (plan_id);
             """.strip()
         )
+        plan_columns = conn.execute("PRAGMA table_info(plans)").fetchall()
+        plan_column_names = {
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in plan_columns
+        }
+        if "pinned" not in plan_column_names:
+            conn.execute("ALTER TABLE plans ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")
+
         slot_columns = conn.execute("PRAGMA table_info(itinerary_slots)").fetchall()
         slot_column_names = {
             str(row["name"] if isinstance(row, sqlite3.Row) else row[1])

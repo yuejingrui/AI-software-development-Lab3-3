@@ -5,6 +5,7 @@ export type Plan = {
   budget: number;
   people_count: number;
   preferences: string;
+  pinned: number;
   created_at: string;
   updated_at: string;
 };

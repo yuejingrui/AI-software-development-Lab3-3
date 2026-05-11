@@ -12,7 +12,7 @@
 
 | 模块 | 说明 |
 | --- | --- |
-| 规划管理 | 创建、编辑、删除、列表查看出行规划（日期/预算/人数/偏好） |
+| 规划管理 | 创建、编辑、删除、列表查看出行规划（日期/预算/人数/偏好），支持排序（名称/时间正序倒序）与置顶 |
 | 地点管理 | 高德地图选点、关键词搜索、逆地理编码、地点增删改 |
 | 多日行程 | 多天编排，每天可设多个时段（含自定义时间），时段间重叠校验 |
 | 天气查询 | 实时天气 + 多日预报，按地点自动匹配行政区 |
@@ -54,15 +54,15 @@ Lab3-3/
 │   ├── vite.config.ts                 # Vite 配置（含 /api 代理）
 │   └── package.json
 ├── cloudfunctions/                    # CloudBase 云函数
-│   ├── api/                           # 主 API 云函数
-│   │   ├── index.js                   #   路由分发与请求入口（exports.main）
-│   │   ├── db.js                      #   SQLite 数据库（sql.js）+ CloudBase 云存储备份
-│   │   ├── utils.js                   #   业务逻辑（地图/天气/AI/路径/风险/校验）
-│   │   ├── response.js                #   统一响应格式 + CORS 头
-│   │   ├── errors.js                  #   错误码枚举 + AppError 类
-│   │   ├── secrets.js                 #   环境变量读取（密钥不进代码）
-│   │   └── package.json
-│   └── common/                        # 共享模块（与 api/ 保持同步）
+│   └── api/                           # 主 API 云函数
+│       ├── index.js                   #   路由分发与请求入口（exports.main）
+│       ├── store.js                   #   CloudBase 文档数据库访问层
+│       ├── db.js                      #   SQLite 内存快照 + CloudBase 云存储备份（遗留）
+│       ├── utils.js                   #   业务逻辑（地图/天气/AI/路径/风险/校验）
+│       ├── response.js                #   统一响应格式 + CORS 头
+│       ├── errors.js                  #   错误码枚举 + AppError 类
+│       ├── secrets.js                 #   环境变量读取（密钥不进代码）
+│       └── package.json
 ├── backend/                           # 原始 FastAPI 后端（已弃用，保留备查）
 ├── config/mcporter.json               # CloudBase MCP 配置
 ├── cloudbaserc.json                   # CloudBase 函数部署配置
@@ -84,6 +84,8 @@ Lab3-3/
 | POST | `/plans` | 创建规划 |
 | GET | `/plans/:id` | 获取规划详情 |
 | PUT | `/plans/:id` | 更新规划 |
+| DELETE | `/plans/:id` | 删除规划（级联删除关联数据） |
+| PUT | `/plans/:id/pin` | 切换规划置顶状态 |
 | GET | `/plans/:id/places` | 获取规划下所有地点 |
 | POST | `/plans/:id/places` | 向规划添加地点 |
 | GET | `/places` | 全部地点列表 |
@@ -105,13 +107,13 @@ Lab3-3/
 
 | 表 | 说明 |
 | --- | --- |
-| `plans` | 规划主表（标题、日期、预算、人数、偏好、时间戳） |
+| `plans` | 规划主表（标题、日期、预算、人数、偏好、置顶标记、时间戳） |
 | `places` | 地点表（名称、地址、经纬度，外键关联 plan_id） |
 | `itinerary_slots` | 行程时段表（天数、标签、起止分钟、排序、备注） |
 | `itinerary_slot_places` | 时段-地点关联表（多对多，含排序） |
 | `risk_check_cache` | 风险检查缓存表 |
 
-数据库已迁移为 CloudBase 文档数据库（多实例共享一致数据），云函数直接对集合进行读写，不再依赖本地 SQLite 快照同步。
+数据库采用双层存储架构：[store.js](cloudfunctions/api/store.js) 提供 CloudBase 文档数据库的持久化读写，[db.js](cloudfunctions/api/db.js) 保留 SQLite 内存快照 + 云存储备份用于写后读一致性和灾难恢复。两套存储通过统一的 API 层对外暴露，上层业务无感知。
 
 ## 技术栈
 
@@ -196,5 +198,7 @@ tcb hosting deploy frontend/dist -e lab3-3-d5gdcm7qo10ced8af
 ```text
 feat: v2.0 后端迁移至 CloudBase 云函数
 feat: v2.1 前端部署至 CloudBase 静态托管，全链路上线
-feat: v2.2 {自主拓展简述}
+refactor(api): migrate storage from SQLite snapshot to CloudBase document DB
+fix: improve write-read consistency and backup reliability
+feat: v2.1.3 规划列表增加删除/排序/置顶功能，时间显示改为东八区
 ```

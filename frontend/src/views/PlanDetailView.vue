@@ -199,12 +199,13 @@ function formatDateTime(value: string): string {
   if (!value.trim()) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  const second = String(date.getSeconds()).padStart(2, "0");
+  const utc8 = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+  const year = utc8.getUTCFullYear();
+  const month = String(utc8.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(utc8.getUTCDate()).padStart(2, "0");
+  const hour = String(utc8.getUTCHours()).padStart(2, "0");
+  const minute = String(utc8.getUTCMinutes()).padStart(2, "0");
+  const second = String(utc8.getUTCSeconds()).padStart(2, "0");
   return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
 

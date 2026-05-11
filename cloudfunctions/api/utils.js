@@ -62,6 +62,7 @@ function mapPlanRow(row) {
     budget: row.budget,
     people_count: row.people_count,
     preferences: row.preferences,
+    pinned: row.pinned != null ? row.pinned : 0,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };

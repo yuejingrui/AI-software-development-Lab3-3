@@ -51,6 +51,7 @@ class PlanData(BaseModel):
     budget: float
     people_count: int
     preferences: str
+    pinned: int = 0
     created_at: str
     updated_at: str
 
@@ -241,6 +242,7 @@ def _map_plan_row(row: Any) -> PlanData:
         budget=row["budget"],
         people_count=row["people_count"],
         preferences=row["preferences"],
+        pinned=int(row["pinned"]) if "pinned" in row.keys() else 0,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -1223,6 +1225,34 @@ def create_app() -> FastAPI:
         with db_conn() as conn:
             rows = conn.execute("SELECT * FROM plans ORDER BY updated_at DESC, id DESC").fetchall()
             return ok([_map_plan_row(row) for row in rows])
+
+    @app.delete("/plans/{plan_id}", response_model=ApiResponse[dict[str, bool]])
+    def delete_plan(plan_id: int) -> ApiResponse[dict[str, bool]]:
+        with db_conn() as conn:
+            conn.execute("DELETE FROM itinerary_slot_places WHERE slot_id IN (SELECT id FROM itinerary_slots WHERE plan_id = ?)", (plan_id,))
+            conn.execute("DELETE FROM itinerary_slots WHERE plan_id = ?", (plan_id,))
+            conn.execute("DELETE FROM places WHERE plan_id = ?", (plan_id,))
+            conn.execute("DELETE FROM risk_check_cache WHERE plan_id = ?", (plan_id,))
+            cursor = conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise AppError(code=ErrorCode.NOT_FOUND, message="规划不存在", http_status=404)
+        return ok({"deleted": True})
+
+    @app.put("/plans/{plan_id}/pin", response_model=ApiResponse[PlanData])
+    def toggle_plan_pin(plan_id: int) -> ApiResponse[PlanData]:
+        now = _now_iso()
+        with db_conn() as conn:
+            row = conn.execute("SELECT pinned FROM plans WHERE id = ?", (plan_id,)).fetchone()
+            if row is None:
+                raise AppError(code=ErrorCode.NOT_FOUND, message="规划不存在", http_status=404)
+            new_pinned = 0 if int(row["pinned"]) else 1
+            conn.execute("UPDATE plans SET pinned = ?, updated_at = ? WHERE id = ?", (new_pinned, now, plan_id))
+            conn.commit()
+            updated = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+            if updated is None:
+                raise AppError(code=ErrorCode.DB, message="读取更新后规划失败", http_status=500)
+            return ok(_map_plan_row(updated))
 
     @app.post("/plans/{plan_id}/places", response_model=ApiResponse[PlaceData])
     def create_place(plan_id: int, payload: PlaceCreateInput) -> ApiResponse[PlaceData]:

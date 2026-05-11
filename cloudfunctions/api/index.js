@@ -41,7 +41,9 @@ function matchRoute(path) {
   if (path.startsWith("/api/") || path === "/api") path = path.slice(4) || "/";
   if (path === "/health") return { handler: "health" };
   if (path === "/plans") return { handler: "plans" };
-  let m = path.match(/^\/plans\/(\d+)$/);
+  let m = path.match(/^\/plans\/(\d+)\/pin$/);
+  if (m) return { handler: "plan_pin", plan_id: parseInt(m[1], 10) };
+  m = path.match(/^\/plans\/(\d+)$/);
   if (m) return { handler: "plan_by_id", plan_id: parseInt(m[1], 10) };
   m = path.match(/^\/plans\/(\d+)\/places$/);
   if (m) return { handler: "plan_places", plan_id: parseInt(m[1], 10) };
@@ -126,6 +128,7 @@ async function routeRequest(event) {
         budget: Number(payload.budget),
         people_count: Number(payload.people_count),
         preferences: (payload.preferences || "").trim(),
+        pinned: 0,
         created_at: now,
         updated_at: now,
       });
@@ -173,6 +176,31 @@ async function routeRequest(event) {
       });
       if (!updated) throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
       await invalidatePlanRiskCheckCache(planId);
+      const row = await findOneByField(COLLECTIONS.plans, "id", planId);
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(mapPlanRow(row))) };
+    }
+    if (httpMethod === "DELETE") {
+      const plan = await findOneByField(COLLECTIONS.plans, "id", planId);
+      if (!plan) throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
+      const slots = await listByField(COLLECTIONS.itinerarySlots, "plan_id", planId);
+      const slotIds = slots.map((s) => s.id);
+      await removeByFieldIn(COLLECTIONS.itinerarySlotPlaces, "slot_id", slotIds);
+      await removeByField(COLLECTIONS.itinerarySlots, "plan_id", planId);
+      await removeByField(COLLECTIONS.places, "plan_id", planId);
+      await removeByField(COLLECTIONS.riskCheckCache, "plan_id", planId);
+      await removeByField(COLLECTIONS.plans, "id", planId);
+      return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok({ deleted: true })) };
+    }
+    return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
+  }
+
+  if (route.handler === "plan_pin") {
+    const planId = route.plan_id;
+    if (httpMethod === "PUT") {
+      const plan = await findOneByField(COLLECTIONS.plans, "id", planId);
+      if (!plan) throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
+      const newPinned = plan.pinned ? 0 : 1;
+      await updateByField(COLLECTIONS.plans, "id", planId, { pinned: newPinned, updated_at: nowIso() });
       const row = await findOneByField(COLLECTIONS.plans, "id", planId);
       return { statusCode: 200, headers: corsHeaders(origin), body: JSON.stringify(ok(mapPlanRow(row))) };
     }
