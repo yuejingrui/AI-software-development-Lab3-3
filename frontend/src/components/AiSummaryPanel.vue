@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { apiPost } from "../lib/api";
 
 type AiSummaryResult = {
@@ -44,6 +44,7 @@ const sessions = ref<ChatSession[]>([]);
 const activeSessionId = ref<string>("");
 const historyExpanded = ref(false);
 const sending = ref(false);
+const streaming = ref(false);
 const input = ref("");
 const chatError = ref<string | null>(null);
 
@@ -118,7 +119,9 @@ const latestAssistantSummary = computed<ChatMessage | null>(() => {
   if (!current) return null;
   for (let i = current.messages.length - 1; i >= 0; i -= 1) {
     const message = current.messages[i];
-    if (message.role === "assistant") return message;
+    if (message.role === "assistant" && (message.strengths?.length || message.risks?.length || message.improvements?.length)) {
+      return message;
+    }
   }
   return null;
 });
@@ -152,6 +155,44 @@ function buildHistoryPayload(messages: ChatMessage[]): Array<{ role: ChatRole; c
     .map((message) => ({ role: message.role, content: message.content }));
 }
 
+function scrollChatToBottom(): void {
+  nextTick(() => {
+    const box = document.querySelector(".chat-box");
+    if (box) box.scrollTop = box.scrollHeight;
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function playTypewriter(
+  message: ChatMessage,
+  result: AiSummaryResult
+): Promise<void> {
+  const reply = (result.reply || "").trim();
+  message.content = "";
+  if (!reply) {
+    message.strengths = result.strengths;
+    message.risks = result.risks;
+    message.improvements = result.improvements;
+    return;
+  }
+
+  const fastChars = 24;
+  for (let i = 0; i < reply.length; i += 1) {
+    message.content += reply[i];
+    if (i < fastChars || i % 3 === 0) {
+      scrollChatToBottom();
+    }
+    await sleep(i < 80 ? 18 : 10);
+  }
+  message.strengths = result.strengths;
+  message.risks = result.risks;
+  message.improvements = result.improvements;
+  scrollChatToBottom();
+}
+
 async function sendQuestion(): Promise<void> {
   chatError.value = null;
   if (props.planId === null) {
@@ -172,32 +213,51 @@ async function sendQuestion(): Promise<void> {
     content: question,
     createdAt: nowIso(),
   };
+  const assistantMessage: ChatMessage = {
+    role: "assistant",
+    content: "",
+    createdAt: nowIso(),
+  };
   updateActiveSession((session) => {
     session.messages.push(userMessage);
+    session.messages.push(assistantMessage);
     session.name = safePlanTitle();
   });
   input.value = "";
   sending.value = true;
+  streaming.value = true;
+
   try {
     const result = await apiPost<AiSummaryResult>(`/plans/${props.planId}/ai-summary`, {
       question,
       history: historyBefore,
     });
-    const assistantMessage: ChatMessage = {
-      role: "assistant",
-      content: result.reply,
-      strengths: result.strengths,
-      risks: result.risks,
-      improvements: result.improvements,
-      createdAt: nowIso(),
-    };
     updateActiveSession((session) => {
-      session.messages.push(assistantMessage);
+      const msgs = session.messages;
+      const lastMsg = msgs[msgs.length - 1];
+      if (!lastMsg || lastMsg.role !== "assistant") return;
+      lastMsg.strengths = [];
+      lastMsg.risks = [];
+      lastMsg.improvements = [];
     });
+    const session = activeSession.value;
+    const lastMsg = session?.messages[session.messages.length - 1];
+    if (lastMsg && lastMsg.role === "assistant") {
+      await playTypewriter(lastMsg, result);
+      saveSessionsToStorage();
+    }
   } catch (e) {
     chatError.value = e instanceof Error ? e.message : "AI 总结失败，请稍后再试";
+    updateActiveSession((session) => {
+      const msgs = session.messages;
+      const lastMsg = msgs[msgs.length - 1];
+      if (lastMsg && lastMsg.role === "assistant" && !lastMsg.content.trim()) {
+        lastMsg.content = "AI 回复生成失败";
+      }
+    });
   } finally {
     sending.value = false;
+    streaming.value = false;
   }
 }
 
@@ -251,7 +311,7 @@ watch(
 
     <div class="chat-box">
       <p v-if="!activeSession || activeSession.messages.length === 0" class="muted">
-        还没有聊天记录。可以先问“请帮我检查这份行程是否超预算”。
+        还没有聊天记录。可以先问"请帮我检查这份行程是否超预算"。
       </p>
       <ul v-else class="chat-list">
         <li
@@ -263,12 +323,22 @@ watch(
           <p class="role" :class="message.role === 'user' ? 'user' : 'assistant'">
             {{ message.role === "user" ? "我" : "AI" }}
           </p>
-          <p class="content">{{ message.content }}</p>
+          <p
+            class="content"
+            :class="{ streaming: streaming && message.role === 'assistant' && index === activeSession.messages.length - 1 }"
+          >
+            {{ message.content
+            }}<span
+              v-if="streaming && message.role === 'assistant' && index === activeSession.messages.length - 1 && message.content"
+              class="cursor-blink"
+              >|</span
+            >
+          </p>
         </li>
       </ul>
     </div>
 
-    <section v-if="latestAssistantSummary" class="summary">
+    <section v-if="latestAssistantSummary && !streaming" class="summary">
       <h3>建议摘要</h3>
       <div class="summary-grid">
         <div class="summary-card">
@@ -301,7 +371,7 @@ watch(
         :disabled="sending"
       />
       <button type="button" class="btn primary" :disabled="sending || !input.trim()" @click="sendQuestion">
-        {{ sending ? "生成中..." : "发送给 AI" }}
+        {{ streaming ? "AI 生成中..." : sending ? "生成中..." : "发送给 AI" }}
       </button>
     </div>
     <p v-if="chatError" class="error">{{ chatError }}</p>
@@ -404,6 +474,19 @@ h4 {
   white-space: pre-wrap;
   font-size: 13px;
   line-height: 1.45;
+}
+.content.streaming {
+  border-left: 2px solid #2563eb;
+  padding-left: 6px;
+}
+.cursor-blink {
+  color: #2563eb;
+  font-weight: 700;
+  animation: blink 0.8s infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
 .summary {
   display: grid;

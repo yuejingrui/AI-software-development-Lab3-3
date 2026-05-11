@@ -1122,6 +1122,86 @@ function httpPostJson(url, body, headers, timeoutMs = 12000) {
   });
 }
 
+function buildAiSystemPrompt(plan, places, itinerarySlots, weatherContext, budgetLines, attractionLines) {
+  const placesText =
+    places.length
+      ? places.map((p) => `${p.name}(${p.address})`).join("、")
+      : "暂无地点";
+  const budgetPerPerson = plan.budget / Math.max(plan.people_count, 1);
+  const itineraryText = itineraryContextText(itinerarySlots);
+
+  return [
+    "你是旅行规划助手。请基于提供的结构化上下文生成建议。",
+    "请严格遵守以下输出格式：",
+    "1) 首先输出给用户的综合建议文字（2-4 段，纯文本，不要使用任何 JSON 格式或 markdown 代码块包裹）。",
+    "2) 然后单独一行输出分隔符：---JSON---",
+    "3) 最后输出一个 JSON 对象（其中 reply 字段用空字符串占位即可）：",
+    '{"reply":"","strengths":["优点1","优点2"],"risks":["风险1","风险2"],"improvements":["改进点1","改进点2"]}',
+    "",
+    "其他规则：",
+    "1) 根据天气信息给出出行建议；若当天天气不可用，按日期对应季节给当地典型天气建议。",
+    "2) 结合预算、人数与联网检索到的消费水平信息，判断是否可能超预算并给建议。",
+    "3) 结合时段安排与联网检索到的景点信息（建议游玩时长/时机）提出可执行建议。",
+    "4) 认真阅读备注，给个性化建议。",
+    "5) AI 只是辅助解释，不要替代用户决策；不要虚构不在上下文中的确定性事实，如不确定请明确说明。",
+    "上下文如下：",
+    `- 规划标题：${plan.title}`,
+    `- 日期：${plan.date}`,
+    `- 预算：${plan.budget} 元`,
+    `- 人数：${plan.people_count} 人`,
+    `- 人均预算：${budgetPerPerson.toFixed(2)} 元`,
+    `- 用户备注：${plan.preferences || "无"}`,
+    `- 地点列表：${placesText}`,
+    `- 天气上下文：${weatherContext}`,
+    `- 时段安排：`,
+    itineraryText,
+    `- 联网检索（消费水平）：`,
+    budgetLines,
+    `- 联网检索（景点游览建议）：`,
+    attractionLines,
+  ].join("\n");
+}
+
+function buildRegularAiSystemPrompt(plan, places, itinerarySlots, weatherContext, budgetLines, attractionLines) {
+  const placesText =
+    places.length
+      ? places.map((p) => `${p.name}(${p.address})`).join("、")
+      : "暂无地点";
+  const budgetPerPerson = plan.budget / Math.max(plan.people_count, 1);
+  const itineraryText = itineraryContextText(itinerarySlots);
+
+  return [
+    "你是旅行规划助手。请基于提供的结构化上下文生成建议，输出必须是 JSON：",
+    "{",
+    '  "reply": "给用户的综合建议，2-4 段",',
+    '  "strengths": ["优点1", "优点2"],',
+    '  "risks": ["风险1", "风险2"],',
+    '  "improvements": ["改进点1", "改进点2"]',
+    "}",
+    "请严格遵守：",
+    "1) 根据天气信息给出出行建议；若当天天气不可用，按日期对应季节给当地典型天气建议。",
+    "2) 结合预算、人数与联网检索到的消费水平信息，判断是否可能超预算并给建议。",
+    "3) 结合时段安排与联网检索到的景点信息（建议游玩时长/时机）提出可执行建议。",
+    "4) 认真阅读备注，给个性化建议。",
+    "5) AI 只是辅助解释，不要替代用户决策；不要虚构不在上下文中的确定性事实，如不确定请明确说明。",
+    "上下文如下：",
+    `- 规划标题：${plan.title}`,
+    `- 日期：${plan.date}`,
+    `- 预算：${plan.budget} 元`,
+    `- 人数：${plan.people_count} 人`,
+    `- 人均预算：${budgetPerPerson.toFixed(2)} 元`,
+    `- 用户备注：${plan.preferences || "无"}`,
+    `- 地点列表：${placesText}`,
+    `- 天气上下文：${weatherContext}`,
+    `- 时段安排：`,
+    itineraryText,
+    `- 联网检索（消费水平）：`,
+    budgetLines,
+    `- 联网检索（景点游览建议）：`,
+    attractionLines,
+  ].join("\n");
+}
+
 async function callDeepSeekForSummary(plan, places, itinerarySlots, payload) {
   const apiKey = resolveDeepSeekApiKey();
   const { text: weatherContext, usedFallback: usedWeatherFallback } =
@@ -1148,12 +1228,12 @@ async function callDeepSeekForSummary(plan, places, itinerarySlots, payload) {
   }
   attractionSnippets = attractionSnippets.slice(0, 6);
 
-  const placesText =
-    places.length
-      ? places.map((p) => `${p.name}(${p.address})`).join("、")
-      : "暂无地点";
-  const budgetPerPerson = plan.budget / Math.max(plan.people_count, 1);
-  const itineraryText = itineraryContextText(itinerarySlots);
+  const budgetLines = budgetSnippets.length
+    ? budgetSnippets.map((line) => `* ${line}`).join("\n")
+    : "* 未检索到有效结果，请用保守估计并说明不确定性";
+  const attractionLines = attractionSnippets.length
+    ? attractionSnippets.map((line) => `* ${line}`).join("\n")
+    : "* 未检索到有效结果，请基于通用经验给出建议并说明不确定性";
 
   const historyForPrompt = (payload.history || [])
     .slice(-10)
@@ -1163,44 +1243,7 @@ async function callDeepSeekForSummary(plan, places, itinerarySlots, payload) {
       content: (item.content || "").trim(),
     }));
 
-  const budgetLines = budgetSnippets.length
-    ? budgetSnippets.map((line) => `* ${line}`).join("\n")
-    : "* 未检索到有效结果，请用保守估计并说明不确定性";
-  const attractionLines = attractionSnippets.length
-    ? attractionSnippets.map((line) => `* ${line}`).join("\n")
-    : "* 未检索到有效结果，请基于通用经验给出建议并说明不确定性";
-
-  const systemPrompt =
-    [
-      "你是旅行规划助手。请基于提供的结构化上下文生成建议，输出必须是 JSON：",
-      "{",
-      '  "reply": "给用户的综合建议，2-4 段",',
-      '  "strengths": ["优点1", "优点2"],',
-      '  "risks": ["风险1", "风险2"],',
-      '  "improvements": ["改进点1", "改进点2"]',
-      "}",
-      "请严格遵守：",
-      "1) 根据天气信息给出出行建议；若当天天气不可用，按日期对应季节给当地典型天气建议。",
-      "2) 结合预算、人数与联网检索到的消费水平信息，判断是否可能超预算并给建议。",
-      "3) 结合时段安排与联网检索到的景点信息（建议游玩时长/时机）提出可执行建议。",
-      "4) 认真阅读备注，给个性化建议。",
-      "5) AI 只是辅助解释，不要替代用户决策；不要虚构不在上下文中的确定性事实，如不确定请明确说明。",
-      "上下文如下：",
-      `- 规划标题：${plan.title}`,
-      `- 日期：${plan.date}`,
-      `- 预算：${plan.budget} 元`,
-      `- 人数：${plan.people_count} 人`,
-      `- 人均预算：${budgetPerPerson.toFixed(2)} 元`,
-      `- 用户备注：${plan.preferences || "无"}`,
-      `- 地点列表：${placesText}`,
-      `- 天气上下文：${weatherContext}`,
-      `- 时段安排：`,
-      itineraryText,
-      `- 联网检索（消费水平）：`,
-      budgetLines,
-      `- 联网检索（景点游览建议）：`,
-      attractionLines,
-    ].join("\n");
+  const systemPrompt = buildRegularAiSystemPrompt(plan, places, itinerarySlots, weatherContext, budgetLines, attractionLines);
 
   const messages = [{ role: "system", content: systemPrompt }];
   messages.push(...historyForPrompt);
@@ -1257,6 +1300,260 @@ async function callDeepSeekForSummary(plan, places, itinerarySlots, payload) {
   };
 }
 
+/**
+ * Streaming version — calls DeepSeek with stream:true and returns a Node.js
+ * Readable that emits SSE events. The frontend can consume these progressively.
+ *
+ * SSE events:
+ *   event: token   data: {"text":"..."}     ← incremental reply text
+ *   event: done    data: {reply,strengths,risks,improvements}
+ *   event: error   data: {message:"..."}
+ */
+async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payload) {
+  const { Readable } = require("stream");
+  const apiKey = resolveDeepSeekApiKey();
+  const { text: weatherContext } = await weatherContextForAi(plan, places);
+  const cityHint = await loadSearchCityHint(places);
+
+  const budgetQuery = `${cityHint} 旅游 人均 消费 水平 餐饮 交通 门票`;
+  const budgetSnippets = await webSearchSnippets(budgetQuery, 3, 1.0);
+
+  const placeNames = places.slice(0, 3).map((p) => p.name);
+  let attractionSnippets = [];
+  for (const placeName of placeNames) {
+    if (attractionSnippets.length >= 6) break;
+    const snippets = await webSearchSnippets(`${placeName} 建议游玩时长 适合游览时间`, 2, 1.0);
+    attractionSnippets = attractionSnippets.concat(snippets);
+  }
+  attractionSnippets = attractionSnippets.slice(0, 6);
+
+  const budgetLines = budgetSnippets.length
+    ? budgetSnippets.map((line) => `* ${line}`).join("\n")
+    : "* 未检索到有效结果，请用保守估计并说明不确定性";
+  const attractionLines = attractionSnippets.length
+    ? attractionSnippets.map((line) => `* ${line}`).join("\n")
+    : "* 未检索到有效结果，请基于通用经验给出建议并说明不确定性";
+
+  const historyForPrompt = (payload.history || [])
+    .slice(-10)
+    .filter((item) => (item.content || "").trim())
+    .map((item) => ({ role: item.role, content: (item.content || "").trim() }));
+
+  const systemPrompt = buildAiSystemPrompt(plan, places, itinerarySlots, weatherContext, budgetLines, attractionLines);
+
+  const messages = [{ role: "system", content: systemPrompt }];
+  messages.push(...historyForPrompt);
+  messages.push({ role: "user", content: (payload.question || "").trim() });
+
+  const requestBody = {
+    model: "deepseek-chat",
+    temperature: 0.4,
+    messages: messages,
+    stream: true,
+  };
+
+  console.log("[ai_summary_stream] calling DeepSeek with stream:", requestBody.model);
+
+  const stream = new Readable({
+    read() { /* no-op — data is pushed from the HTTP response handler */ },
+  });
+
+  const urlObj = new URL("https://api.deepseek.com/v1/chat/completions");
+  const postData = JSON.stringify(requestBody);
+
+  const req = https.request(
+    {
+      hostname: urlObj.hostname,
+      port: urlObj.port || 443,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "text/event-stream",
+      },
+      timeout: 90000,
+    },
+    (res) => {
+      if ((res.statusCode || 200) >= 400) {
+        let errorBody = "";
+        res.on("data", (chunk) => {
+          errorBody += chunk.toString();
+        });
+        res.on("end", () => {
+          const message = `AI 服务返回异常状态 ${res.statusCode}${errorBody ? `: ${errorBody.slice(0, 300)}` : ""}`;
+          console.error("[ai_summary_stream] bad status:", message);
+          if (!stream.destroyed) {
+            stream.push(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
+            stream.push(null);
+          }
+        });
+        return;
+      }
+
+      let sseBuffer = "";
+      let replyBuffer = "";
+      let foundSplit = false;
+      let jsonBuffer = "";
+      const SPLIT = "---JSON---";
+
+      res.on("data", (chunk) => {
+        sseBuffer += chunk.toString();
+
+        // DeepSeek SSE lines are separated by \n\n
+        const parts = sseBuffer.split("\n\n");
+        sseBuffer = parts.pop() || "";
+
+        for (const part of parts) {
+          const trimmed = part.trim();
+          if (!trimmed) continue;
+
+          // Extract the data: line
+          const lines = trimmed.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const dataStr = line.slice(6).trim();
+            if (dataStr === "[DONE]") {
+              // Stream ended — parse JSON and send done event
+              let summary;
+              try {
+                summary = JSON.parse(jsonBuffer.trim());
+              } catch {
+                // Fallback: try to extract JSON from buffer
+                const match = (jsonBuffer || "").match(/\{[\s\S]*\}/);
+                if (match) {
+                  try {
+                    summary = JSON.parse(match[0]);
+                  } catch {
+                    summary = { strengths: [], risks: [], improvements: [] };
+                  }
+                } else {
+                  summary = { strengths: [], risks: [], improvements: [] };
+                }
+              }
+              const strengths = (summary.strengths || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+              const risks = (summary.risks || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+              const improvements = (summary.improvements || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+
+              const donePayload = JSON.stringify({
+                reply: replyBuffer.trim(),
+                strengths,
+                risks,
+                improvements,
+              });
+              stream.push(`event: done\ndata: ${donePayload}\n\n`);
+              stream.push(null);
+              return;
+            }
+
+            try {
+              const parsed = JSON.parse(dataStr);
+              const delta = parsed.choices?.[0]?.delta?.content;
+              if (!delta) continue;
+
+              if (!foundSplit) {
+                // Append new text and check for the split marker
+                replyBuffer += delta;
+                const splitIdx = replyBuffer.indexOf(SPLIT);
+                if (splitIdx !== -1) {
+                  // Stream everything before the split, keep the rest for JSON parsing
+                  const beforeSplit = replyBuffer.substring(0, splitIdx);
+                  if (beforeSplit) {
+                    stream.push(`event: token\ndata: ${JSON.stringify({ text: beforeSplit })}\n\n`);
+                  }
+                  jsonBuffer = replyBuffer.substring(splitIdx + SPLIT.length);
+                  replyBuffer = beforeSplit; // Final reply is everything before SPLIT
+                  foundSplit = true;
+                }
+                // Don't stream yet while we're looking for the split —
+                // we only emit tokens from the "safe" portion (already checked for split)
+              } else {
+                jsonBuffer += delta;
+              }
+            } catch {
+              // Skip unparseable SSE data lines
+            }
+          }
+        }
+
+        // Stream safe portion of replyBuffer (everything except the last SPLIT.length chars,
+        // which might be the start of the split marker split across chunks)
+        if (!foundSplit && replyBuffer.length > SPLIT.length) {
+          const safeLen = replyBuffer.length - SPLIT.length + 1;
+          if (safeLen > 0) {
+            const safeText = replyBuffer.substring(0, safeLen);
+            stream.push(`event: token\ndata: ${JSON.stringify({ text: safeText })}\n\n`);
+            replyBuffer = replyBuffer.substring(safeLen);
+          }
+        }
+      });
+
+      res.on("error", (e) => {
+        console.error("[ai_summary_stream] DeepSeek response error:", e.message);
+        if (!stream.destroyed) {
+          stream.push(`event: error\ndata: ${JSON.stringify({ message: `AI 服务响应错误: ${e.message}` })}\n\n`);
+          stream.push(null);
+        }
+      });
+
+      res.on("end", () => {
+        // If [DONE] was already processed, stream was already ended
+        if (stream.destroyed) return;
+
+        // Stream any remaining safe reply text
+        if (!foundSplit && replyBuffer.trim()) {
+          stream.push(`event: token\ndata: ${JSON.stringify({ text: replyBuffer })}\n\n`);
+        }
+
+        // Try to parse summary from whatever we have
+        let summaryJson = jsonBuffer.trim() || replyBuffer.trim();
+        let summary;
+        try {
+          summary = JSON.parse(summaryJson);
+        } catch {
+          const match = summaryJson.match(/\{[\s\S]*\}/);
+          if (match) {
+            try { summary = JSON.parse(match[0]); } catch { summary = null; }
+          }
+        }
+        if (!summary) summary = { strengths: [], risks: [], improvements: [] };
+
+        const strengths = (summary.strengths || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+        const risks = (summary.risks || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+        const improvements = (summary.improvements || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
+        const finalReply = foundSplit ? replyBuffer.trim() : (replyBuffer.trim() || summary.reply || "");
+
+        const donePayload = JSON.stringify({ reply: finalReply, strengths, risks, improvements });
+        stream.push(`event: done\ndata: ${donePayload}\n\n`);
+        stream.push(null);
+      });
+    }
+  );
+
+  req.on("error", (e) => {
+    console.error("[ai_summary_stream] request error:", e.message);
+    if (!stream.destroyed) {
+      stream.push(`event: error\ndata: ${JSON.stringify({ message: `AI 服务网络错误: ${e.message}` })}\n\n`);
+      stream.push(null);
+    }
+  });
+
+  req.on("timeout", () => {
+    console.error("[ai_summary_stream] request timeout");
+    req.destroy();
+    if (!stream.destroyed) {
+      stream.push(`event: error\ndata: ${JSON.stringify({ message: "AI 服务调用超时" })}\n\n`);
+      stream.push(null);
+    }
+  });
+
+  req.write(postData);
+  req.end();
+
+  return stream;
+}
+
 module.exports = {
   nowIso,
   isPlaceholder,
@@ -1299,4 +1596,5 @@ module.exports = {
   itineraryContextText,
   parseAiJsonResponse,
   callDeepSeekForSummary,
+  callDeepSeekForSummaryStream,
 };

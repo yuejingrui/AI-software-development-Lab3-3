@@ -35,6 +35,7 @@ const {
   loadWeatherForecastByAdcode,
   evaluateWeatherRisk,
   callDeepSeekForSummary,
+  callDeepSeekForSummaryStream,
 } = require("./utils");
 
 function matchRoute(path) {
@@ -346,10 +347,60 @@ async function routeRequest(event) {
   if (route.handler === "ai_summary") {
     if (httpMethod !== "POST") return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
     const planId = route.plan_id;
+    const useStream = params.stream === "1";
+
     await retryOnPlanNotFound(async () => ensurePlanExists(planId));
     const plan = await retryOnPlanNotFound(async () => loadPlan(planId));
     const places = await loadPlanPlaces(planId);
     const itinerarySlots = await loadPlanItinerary(planId);
+
+    // ── Streaming path ──────────────────────────────────────────
+    if (useStream) {
+      try {
+        const stream = await callDeepSeekForSummaryStream(plan, places, itinerarySlots, payload);
+        return {
+          statusCode: 200,
+          headers: {
+            ...corsHeaders(origin),
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          },
+          body: stream,
+        };
+      } catch (e) {
+        console.error("[ai_summary stream] error:", e.message || e, "code:", e.code || "none");
+        const { Readable } = require("stream");
+        const errStream = new Readable({ read() {} });
+        const placeCount = places.length;
+        const hasNotes = !!(plan.preferences || "").trim();
+        const fallback = {
+          reply: "AI 服务当前不可用，已返回降级建议：请优先检查天气与时段冲突、核对预算与人数的人均成本，并在关键时段预留机动时间。",
+          strengths: ["已完成基础规划信息（日期/预算/人数）", `已加入地点数量：${placeCount}`],
+          risks: ["外部 AI 服务暂时不可用，建议稍后重试", "若当天天气突变，户外时段可能需要调整"],
+          improvements: [
+            "优先补齐每个时段的核心地点与预计停留时长",
+            "为交通与排队预留 15~30 分钟缓冲",
+            hasNotes ? "若有个性化备注，建议逐项映射到时段安排" : "可补充个性化备注以获得更精准建议",
+          ],
+        };
+        const donePayload = JSON.stringify(fallback);
+        errStream.push(`event: done\ndata: ${donePayload}\n\n`);
+        errStream.push(null);
+        return {
+          statusCode: 200,
+          headers: {
+            ...corsHeaders(origin),
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+          },
+          body: errStream,
+        };
+      }
+    }
+
+    // ── Non-streaming path ──────────────────────────────────────
     let result;
     try {
       result = await callDeepSeekForSummary(plan, places, itinerarySlots, payload);
