@@ -34,7 +34,7 @@ const {
   resolveAdminByLocation,
   loadWeatherForecastByAdcode,
   evaluateWeatherRisk,
-  callGlmForSummary,
+  callDeepSeekForSummary,
 } = require("./utils");
 
 function matchRoute(path) {
@@ -352,8 +352,9 @@ async function routeRequest(event) {
     const itinerarySlots = await loadPlanItinerary(planId);
     let result;
     try {
-      result = await callGlmForSummary(plan, places, itinerarySlots, payload);
+      result = await callDeepSeekForSummary(plan, places, itinerarySlots, payload);
     } catch (e) {
+      console.error("[ai_summary] error:", e.message || e, "code:", e.code || "none");
       if (!(e instanceof AppError)) throw e;
       const placeCount = places.length;
       const hasNotes = !!(plan.preferences || "").trim();

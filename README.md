@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-智能出行规划器是一个前后端分离的 Web 应用，支持用户创建出行规划、在地图上选择地点、编排多日行程时段、查看天气与风险提示，并通过 AI（智谱 GLM-4 Flash）生成旅行建议。
+智能出行规划器是一个前后端分离的 Web 应用，支持用户创建出行规划、在地图上选择地点、编排多日行程时段、查看天气与风险提示，并通过 AI（DeepSeek-V4-Flash）生成旅行建议。
 
 本项目是 Lab 3-2 的云端迁移版本，后端已从 Python FastAPI 重构为 Node.js 云函数，部署于腾讯云 CloudBase。
 
@@ -18,7 +18,7 @@
 | 天气查询 | 实时天气 + 多日预报，按地点自动匹配行政区 |
 | 风险检查 | 基于规划日期与天气预报判断雨雪户外风险 |
 | 日路线规划 | 地点间步行/驾车/公交路径计算与耗时估算 |
-| AI 辅助总结 | 聚合地点、天气、预算、时段信息，调用 GLM-4 Flash + DuckDuckGo 联网检索生成建议 |
+| AI 辅助总结 | 聚合地点、天气、预算、时段信息，调用 DeepSeek-V4-Flash + DuckDuckGo 联网检索生成建议 |
 
 ## 目录结构
 
@@ -125,7 +125,7 @@ Lab3-3/
 | 地图 SDK | 高德地图 JS API 2.0 |
 | 后端运行时 | Node.js 18.15（CloudBase 云函数） |
 | 数据库 | CloudBase 文档数据库（共享持久化） |
-| AI 模型 | 智谱 GLM-4 Flash |
+| AI 模型 | DeepSeek-V4-Flash |
 | 联网检索 | DuckDuckGo Instant Answer API |
 | 部署平台 | 腾讯云 CloudBase（云函数 + 静态托管） |
 
@@ -145,7 +145,7 @@ Lab3-3/
    ```
 
 2. 配置环境变量（复制 `.env.example` 为 `.env`，填入真实密钥）：
-   - `GLM_SECRET` / `GLM_API_KEY` — 智谱 AI 密钥
+   - `DEEPSEEK_API_KEY` — DeepSeek AI 密钥
    - `AMAP_JS_KEY` / `AMAP_SECURITY_JS_CODE` — 高德地图 Web 端 Key
    - `AMAP_WEB_SERVICE_KEY` — 高德地图 Web 服务 Key
 

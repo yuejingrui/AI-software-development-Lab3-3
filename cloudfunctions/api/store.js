@@ -17,7 +17,7 @@ let _db = null;
 let _ensureCollectionsPromise = null;
 
 function nowIso() {
-  return new Date().toISOString().replace(/\.\d{3}Z$/, "");
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 function getDb() {

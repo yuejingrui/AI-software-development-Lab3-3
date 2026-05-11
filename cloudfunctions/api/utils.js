@@ -16,11 +16,10 @@ const {
   nowIso: storeNowIso,
 } = require("./store");
 const {
+  DeepSeekApiKey,
   YourJsKey,
   YourSecurityJsCode,
   YourWebServiceKey,
-  YourSecret,
-  YourKeyKey,
 } = require("./secrets");
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -827,17 +826,14 @@ async function loadPlanDayRoute(planId, dayIndex) {
   };
 }
 
-// ─── GLM / AI ───────────────────────────────────────────────────────────────
+// ─── DeepSeek / AI ───────────────────────────────────────────────────────────
 
-function resolveGlmApiKey() {
-  const preferred = String(YourKeyKey).trim();
-  const fallback = String(YourSecret).trim();
-  const key =
-    preferred && !isPlaceholder(preferred) ? preferred : fallback;
+function resolveDeepSeekApiKey() {
+  const key = String(DeepSeekApiKey).trim();
   if (!key || isPlaceholder(key)) {
     throw new AppError(
       ErrorCode.VALIDATION,
-      "后端 AI 密钥未配置，请先修改 backend/app/secrets.py",
+      "后端 AI 密钥未配置，请在 CloudBase 控制台设置 DEEPSEEK_API_KEY",
       400
     );
   }
@@ -1126,8 +1122,8 @@ function httpPostJson(url, body, headers, timeoutMs = 12000) {
   });
 }
 
-async function callGlmForSummary(plan, places, itinerarySlots, payload) {
-  const apiKey = resolveGlmApiKey();
+async function callDeepSeekForSummary(plan, places, itinerarySlots, payload) {
+  const apiKey = resolveDeepSeekApiKey();
   const { text: weatherContext, usedFallback: usedWeatherFallback } =
     await weatherContextForAi(plan, places);
   const cityHint = await loadSearchCityHint(places);
@@ -1136,7 +1132,7 @@ async function callGlmForSummary(plan, places, itinerarySlots, payload) {
   const budgetSnippets = await webSearchSnippets(
     budgetQuery,
     3,
-    1.5
+    1.0
   );
 
   const placeNames = places.slice(0, 3).map((p) => p.name);
@@ -1146,7 +1142,7 @@ async function callGlmForSummary(plan, places, itinerarySlots, payload) {
     const snippets = await webSearchSnippets(
       `${placeName} 建议游玩时长 适合游览时间`,
       2,
-      1.5
+      1.0
     );
     attractionSnippets = attractionSnippets.concat(snippets);
   }
@@ -1211,16 +1207,23 @@ async function callGlmForSummary(plan, places, itinerarySlots, payload) {
   messages.push({ role: "user", content: (payload.question || "").trim() });
 
   const requestBody = {
-    model: "glm-4-flash",
+    model: "deepseek-chat",
     temperature: 0.4,
     messages: messages,
   };
 
-  const responseBody = await httpPostJson(
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    requestBody,
-    { Authorization: `Bearer ${apiKey}` }
-  );
+  console.log("[ai_summary] calling DeepSeek with model:", requestBody.model);
+  let responseBody;
+  try {
+    responseBody = await httpPostJson(
+      "https://api.deepseek.com/v1/chat/completions",
+      requestBody,
+      { Authorization: `Bearer ${apiKey}` }
+    );
+  } catch (e) {
+    console.error("[ai_summary] DeepSeek API call failed:", e.message || e);
+    throw e;
+  }
 
   const choices = responseBody.choices || [];
   if (!choices.length) {
@@ -1288,12 +1291,12 @@ module.exports = {
   buildRouteLeg,
   loadPlanItinerary,
   loadPlanDayRoute,
-  resolveGlmApiKey,
+  resolveDeepSeekApiKey,
   seasonHintText,
   webSearchSnippets,
   weatherContextForAi,
   loadSearchCityHint,
   itineraryContextText,
   parseAiJsonResponse,
-  callGlmForSummary,
+  callDeepSeekForSummary,
 };

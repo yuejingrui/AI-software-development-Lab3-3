@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from .db import db_conn, init_db
 from .errors import AppError, ErrorCode
 from .response import ApiResponse, ok
-from .secrets import YourJsKey, YourKeyKey, YourSecret, YourSecurityJsCode, YourWebServiceKey
+from .secrets import DeepSeekApiKey, YourJsKey, YourSecurityJsCode, YourWebServiceKey
 
 
 class HealthData(BaseModel):
@@ -829,12 +829,10 @@ def _evaluate_weather_risk(plan: PlanData, places: list[PlaceData]) -> WeatherRi
     )
 
 
-def _resolve_glm_api_key() -> str:
-    preferred = str(YourKeyKey).strip()
-    fallback = str(YourSecret).strip()
-    key = preferred if preferred and not _is_placeholder(preferred) else fallback
+def _resolve_deepseek_api_key() -> str:
+    key = str(DeepSeekApiKey).strip()
     if not key or _is_placeholder(key):
-        raise AppError(code=ErrorCode.VALIDATION, message="后端 AI 密钥未配置，请先修改 backend/app/secrets.py", http_status=400)
+        raise AppError(code=ErrorCode.VALIDATION, message="后端 AI 密钥未配置，请设置 DEEPSEEK_API_KEY 环境变量", http_status=400)
     return key
 
 
@@ -989,13 +987,13 @@ def _parse_ai_json_response(content: str) -> tuple[str, list[str], list[str], li
     return (reply, strengths[:5], risks[:5], improvements[:5])
 
 
-def _call_glm_for_summary(
+def _call_deepseek_for_summary(
     plan: PlanData,
     places: list[PlaceData],
     itinerary_slots: list[ItinerarySlotData],
     payload: AiSummaryInput,
 ) -> AiSummaryData:
-    api_key = _resolve_glm_api_key()
+    api_key = _resolve_deepseek_api_key()
     weather_context, used_weather_fallback = _weather_context_for_ai(plan, places)
     city_hint = _load_search_city_hint(places)
     web_deadline = time.monotonic() + 4.0
@@ -1055,12 +1053,12 @@ def _call_glm_for_summary(
     messages.append({"role": "user", "content": payload.question.strip()})
 
     request_body = {
-        "model": "glm-4-flash",
+        "model": "deepseek-v4-flash",
         "temperature": 0.4,
         "messages": messages,
     }
     request = UrlRequest(
-        url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        url="https://api.deepseek.com/v1/chat/completions",
         method="POST",
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -1434,7 +1432,7 @@ def create_app() -> FastAPI:
         places = _load_plan_places(plan_id)
         itinerary_slots = _load_plan_itinerary(plan_id)
         try:
-            result = _call_glm_for_summary(plan=plan, places=places, itinerary_slots=itinerary_slots, payload=payload)
+            result = _call_deepseek_for_summary(plan=plan, places=places, itinerary_slots=itinerary_slots, payload=payload)
         except AppError:
             # 降级为本地规则建议，避免前端出现“Failed to fetch”并中断使用。
             place_count = len(places)

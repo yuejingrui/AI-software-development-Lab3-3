@@ -197,7 +197,8 @@ function slotTimeDisplay(slot: ItineraryDraftSlot): string {
 
 function formatDateTime(value: string): string {
   if (!value.trim()) return "-";
-  const date = new Date(value);
+  const canonical = value.endsWith("Z") || value.includes("+") ? value : value + "Z";
+  const date = new Date(canonical);
   if (Number.isNaN(date.getTime())) return value;
   const utc8 = new Date(date.getTime() + 8 * 60 * 60 * 1000);
   const year = utc8.getUTCFullYear();

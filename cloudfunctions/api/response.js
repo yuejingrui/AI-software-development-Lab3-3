@@ -9,7 +9,7 @@ const ALLOWED_ORIGINS = [
 function resolveAllowOrigin(requestOrigin) {
   if (!requestOrigin) {
     // No Origin header — return first allowed origin as default (for same-origin requests)
-    return ALLOWED_ORIGINS[0] || "*";
+    return ALLOWED_ORIGINS[0] || "";
   }
   // Allow localhost for development
   if (
@@ -23,7 +23,7 @@ function resolveAllowOrigin(requestOrigin) {
     return requestOrigin;
   }
   // Fallback to first allowed origin (for tools like curl without proper Origin)
-  return ALLOWED_ORIGINS[0] || "*";
+  return ALLOWED_ORIGINS[0] || "";
 }
 
 function corsHeaders(requestOrigin) {
