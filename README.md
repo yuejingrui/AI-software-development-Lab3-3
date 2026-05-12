@@ -54,22 +54,21 @@ Lab3-3/
 │   ├── vite.config.ts                 # Vite 配置（含 /api 代理）
 │   └── package.json
 ├── cloudfunctions/                    # CloudBase 云函数
-│   └── api/                           # 主 API 云函数
-│       ├── index.js                   #   路由分发与请求入口（exports.main）
-│       ├── store.js                   #   CloudBase 文档数据库访问层
-│       ├── db.js                      #   SQLite 内存快照 + CloudBase 云存储备份（遗留）
-│       ├── utils.js                   #   业务逻辑（地图/天气/AI/路径/风险/校验）
-│       ├── response.js                #   统一响应格式 + CORS 头
-│       ├── errors.js                  #   错误码枚举 + AppError 类
-│       ├── secrets.js                 #   环境变量读取（密钥不进代码）
-│       └── package.json
-├── backend/                           # 原始 FastAPI 后端（已弃用，保留备查）
-├── config/mcporter.json               # CloudBase MCP 配置
-├── cloudbaserc.json                   # CloudBase 函数部署配置
+│   ├── api-http/                      #   HTTP 云函数（主函数，生产使用）
+│   │   ├── index.js                   #     路由分发 + HTTP 服务入口（支持 SSE 流式）
+│   │   ├── store.js                   #     CloudBase 文档数据库访问层
+│   │   ├── db.js                      #     SQLite 内存快照 + CloudBase 云存储备份（遗留）
+│   │   ├── utils.js                   #     业务逻辑（地图/天气/AI/路径/风险/校验）
+│   │   ├── response.js                #     统一响应格式（CORS 由网关注入）
+│   │   ├── errors.js                  #     错误码枚举 + AppError 类
+│   │   ├── secrets.js                 #     环境变量读取（密钥不进代码）
+│   │   ├── scf_bootstrap              #     HTTP 服务启动引导
+│   │   └── package.json
+│   └── api/                           #   SCF 事件函数（旧版，已弃用保留备查）
+│       └── ...                        #     结构与 api-http 基本一致
+├── cloudbaserc.json                   # CloudBase 项目配置
 ├── .env.example                       # 环境变量模板
 ├── .gitignore
-├── start_backend.ps1                  # 本地后端启动脚本
-├── start_frontend.ps1                 # 本地前端启动脚本
 └── IMPLEMENTATION_PLAN.md             # 实验任务计划
 ```
 
@@ -113,7 +112,7 @@ Lab3-3/
 | `itinerary_slot_places` | 时段-地点关联表（多对多，含排序） |
 | `risk_check_cache` | 风险检查缓存表 |
 
-数据库采用双层存储架构：[store.js](cloudfunctions/api/store.js) 提供 CloudBase 文档数据库的持久化读写，[db.js](cloudfunctions/api/db.js) 保留 SQLite 内存快照 + 云存储备份用于写后读一致性和灾难恢复。两套存储通过统一的 API 层对外暴露，上层业务无感知。
+数据库采用双层存储架构：[store.js](cloudfunctions/api-http/store.js) 提供 CloudBase 文档数据库的持久化读写，[db.js](cloudfunctions/api-http/db.js) 保留 SQLite 内存快照 + 云存储备份用于写后读一致性和灾难恢复。两套存储通过统一的 API 层对外暴露，上层业务无感知。
 
 ## 技术栈
 
@@ -141,6 +140,7 @@ Lab3-3/
 
    ```bash
    cd frontend && npm install
+   cd ../cloudfunctions/api-http && npm install
    cd ../cloudfunctions/api && npm install
    ```
 
@@ -151,13 +151,13 @@ Lab3-3/
 
 3. 启动前端开发服务器：
 
-   ```powershell
-   .\start_frontend.ps1
+   ```bash
+   cd frontend && npm run dev
    ```
 
    前端默认访问：`http://127.0.0.1:5173`
 
-4. 本地开发时，前端 Vite 将 `/api` 请求代理到云函数公网地址，也可通过修改 `frontend/vite.config.ts` 中的 proxy target 指向本地后端。
+4. 本地开发时，前端通过 `VITE_API_BASE_URL` 环境变量指向云函数公网地址（见 `frontend/.env.production`）。
 
 ### 部署到 CloudBase
 
@@ -165,8 +165,8 @@ Lab3-3/
 # 构建前端
 cd frontend && npm run build
 
-# 部署云函数
-tcb fn deploy api
+# 部署 HTTP 云函数（主函数）
+tcb fn deploy api-http
 
 # 部署静态托管
 tcb hosting deploy frontend/dist -e lab3-3-d5gdcm7qo10ced8af
@@ -196,9 +196,14 @@ tcb hosting deploy frontend/dist -e lab3-3-d5gdcm7qo10ced8af
 ## Git 提交链
 
 ```text
-feat: v2.0 后端迁移至 CloudBase 云函数
-feat: v2.1 前端部署至 CloudBase 静态托管，全链路上线
+feat(api): add HTTP cloud function for true SSE streaming and collapsible AI replies
+fix(ai): stabilize incremental reply rendering in summary panel
+fix(api): migrate AI backend from GLM to DeepSeek and fix timezone display
+feat(plan): add delete, sort, and pin functionality in plan list view
 refactor(api): migrate storage from SQLite snapshot to CloudBase document DB
 fix: improve write-read consistency and backup reliability
-feat: v2.1.3 规划列表增加删除/排序/置顶功能，时间显示改为东八区
+chore(release): finalize v2.1 with comprehensive documentation and UI enhancements
+refactor(api): migrate backend from FastAPI to Node.js CloudBase
+docs(readme): expand frontend and backend file guide
+feat(itinerary): add day-route map and align day count selection UI
 ```
