@@ -96,7 +96,7 @@ async function retryOnPlanNotFound(task) {
   throw new AppError(ErrorCode.NOT_FOUND, "规划不存在", 404);
 }
 
-async function routeRequest(event) {
+async function routeRequest(event, context) {
   const { path, httpMethod, body: rawBody, queryStringParameters, headers: reqHeaders } = event;
   const origin = (reqHeaders && (reqHeaders.origin || reqHeaders.Origin)) || "";
   const params = queryStringParameters || {};
@@ -356,6 +356,43 @@ async function routeRequest(event) {
 
     // ── Streaming path ──────────────────────────────────────────
     if (useStream) {
+      // Use context.res for true SSE when running as HTTP cloud function
+      const httpRes = context && context.res;
+      if (httpRes) {
+        try {
+          const stream = await callDeepSeekForSummaryStream(plan, places, itinerarySlots, payload);
+          httpRes.writeHead(200, {
+            ...corsHeaders(origin),
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          });
+          stream.pipe(httpRes);
+          return undefined;
+        } catch (e) {
+          console.error("[ai_summary stream] error:", e.message || e, "code:", e.code || "none");
+          if (!httpRes.writableEnded) {
+            const placeCount = places.length;
+            const hasNotes = !!(plan.preferences || "").trim();
+            const fallback = {
+              reply: "AI 服务当前不可用，已返回降级建议：请优先检查天气与时段冲突、核对预算与人数的人均成本，并在关键时段预留机动时间。",
+              strengths: ["已完成基础规划信息（日期/预算/人数）", `已加入地点数量：${placeCount}`],
+              risks: ["外部 AI 服务暂时不可用，建议稍后重试", "若当天天气突变，户外时段可能需要调整"],
+              improvements: [
+                "优先补齐每个时段的核心地点与预计停留时长",
+                "为交通与排队预留 15~30 分钟缓冲",
+                hasNotes ? "若有个性化备注，建议逐项映射到时段安排" : "可补充个性化备注以获得更精准建议",
+              ],
+            };
+            httpRes.write(`event: done\ndata: ${JSON.stringify(fallback)}\n\n`);
+            httpRes.end();
+          }
+          return undefined;
+        }
+      }
+
+      // Fallback for SCF mode (no context.res): return Readable as body
       try {
         const stream = await callDeepSeekForSummaryStream(plan, places, itinerarySlots, payload);
         return {
@@ -527,7 +564,7 @@ async function routeRequest(event) {
   return { statusCode: 405, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(ErrorCode.HTTP, "Method Not Allowed")) };
 }
 
-exports.main = async (event) => {
+exports.main = async (event, context) => {
   const reqHeaders = event.headers || {};
   const origin = (reqHeaders.origin || reqHeaders.Origin) || "";
   if (event.httpMethod === "OPTIONS") {
@@ -536,7 +573,10 @@ exports.main = async (event) => {
 
   await ensureCollections();
   try {
-    return await routeRequest(event);
+    const result = await routeRequest(event, context);
+    // undefined means response was already sent via context.res (HTTP cloud function SSE)
+    if (result === undefined) return;
+    return result;
   } catch (e) {
     if (e instanceof AppError) {
       return { statusCode: e.httpStatus, headers: corsHeaders(origin), body: JSON.stringify(errorResponse(e.code, e.message)) };

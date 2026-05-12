@@ -10,6 +10,15 @@
       "handler": "index.main",
       "include": [],
       "envVariables": {}
+    },
+    {
+      "name": "api-http",
+      "type": "HTTP",
+      "timeout": 90,
+      "runtime": "Nodejs18.15",
+      "handler": "index.main",
+      "include": [],
+      "envVariables": {}
     }
   ]
 }

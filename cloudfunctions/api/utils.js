@@ -1394,6 +1394,7 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
 
       let sseBuffer = "";
       let replyBuffer = "";
+      let fullReply = "";
       let foundSplit = false;
       let jsonBuffer = "";
       const SPLIT = "---JSON---";
@@ -1436,8 +1437,9 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
               const risks = (summary.risks || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
               const improvements = (summary.improvements || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
 
+              const finalReply = fullReply.trim() || replyBuffer.trim();
               const donePayload = JSON.stringify({
-                reply: replyBuffer.trim(),
+                reply: finalReply,
                 strengths,
                 risks,
                 improvements,
@@ -1460,6 +1462,7 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
                   // Stream everything before the split, keep the rest for JSON parsing
                   const beforeSplit = replyBuffer.substring(0, splitIdx);
                   if (beforeSplit) {
+                    fullReply += beforeSplit;
                     stream.push(`event: token\ndata: ${JSON.stringify({ text: beforeSplit })}\n\n`);
                   }
                   jsonBuffer = replyBuffer.substring(splitIdx + SPLIT.length);
@@ -1483,6 +1486,7 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
           const safeLen = replyBuffer.length - SPLIT.length + 1;
           if (safeLen > 0) {
             const safeText = replyBuffer.substring(0, safeLen);
+            fullReply += safeText;
             stream.push(`event: token\ndata: ${JSON.stringify({ text: safeText })}\n\n`);
             replyBuffer = replyBuffer.substring(safeLen);
           }
@@ -1503,6 +1507,7 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
 
         // Stream any remaining safe reply text
         if (!foundSplit && replyBuffer.trim()) {
+          fullReply += replyBuffer;
           stream.push(`event: token\ndata: ${JSON.stringify({ text: replyBuffer })}\n\n`);
         }
 
@@ -1522,7 +1527,7 @@ async function callDeepSeekForSummaryStream(plan, places, itinerarySlots, payloa
         const strengths = (summary.strengths || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
         const risks = (summary.risks || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
         const improvements = (summary.improvements || []).map((s) => String(s).trim()).filter(Boolean).slice(0, 5);
-        const finalReply = foundSplit ? replyBuffer.trim() : (replyBuffer.trim() || summary.reply || "");
+        const finalReply = foundSplit ? (fullReply.trim() || replyBuffer.trim()) : (fullReply.trim() || summary.reply || "");
 
         const donePayload = JSON.stringify({ reply: finalReply, strengths, risks, improvements });
         stream.push(`event: done\ndata: ${donePayload}\n\n`);

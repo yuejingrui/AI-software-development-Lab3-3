@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
-import { apiPost } from "../lib/api";
+import { computed, nextTick, reactive, ref, watch } from "vue";
+import { apiPost, apiPostStream } from "../lib/api";
 
 type AiSummaryResult = {
   reply: string;
@@ -47,6 +47,19 @@ const sending = ref(false);
 const streaming = ref(false);
 const input = ref("");
 const chatError = ref<string | null>(null);
+const collapsedMessageKeys = reactive(new Set<string>());
+
+function messageKey(message: ChatMessage, index: number): string {
+  return `${message.createdAt}-${index}`;
+}
+
+function toggleMessageCollapse(key: string): void {
+  if (collapsedMessageKeys.has(key)) {
+    collapsedMessageKeys.delete(key);
+  } else {
+    collapsedMessageKeys.add(key);
+  }
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -227,34 +240,90 @@ async function sendQuestion(): Promise<void> {
   sending.value = true;
   streaming.value = true;
 
+  let streamSucceeded = false;
   try {
-    const result = await apiPost<AiSummaryResult>(`/plans/${props.planId}/ai-summary`, {
-      question,
-      history: historyBefore,
-    });
-    updateActiveSession((session) => {
-      const msgs = session.messages;
-      const lastMsg = msgs[msgs.length - 1];
-      if (!lastMsg || lastMsg.role !== "assistant") return;
-      lastMsg.strengths = [];
-      lastMsg.risks = [];
-      lastMsg.improvements = [];
-    });
-    const session = activeSession.value;
-    const lastMsg = session?.messages[session.messages.length - 1];
-    if (lastMsg && lastMsg.role === "assistant") {
-      await playTypewriter(lastMsg, result);
-      saveSessionsToStorage();
-    }
-  } catch (e) {
-    chatError.value = e instanceof Error ? e.message : "AI 总结失败，请稍后再试";
-    updateActiveSession((session) => {
-      const msgs = session.messages;
-      const lastMsg = msgs[msgs.length - 1];
-      if (lastMsg && lastMsg.role === "assistant" && !lastMsg.content.trim()) {
-        lastMsg.content = "AI 回复生成失败";
+    await apiPostStream<AiSummaryResult>(
+      `/plans/${props.planId}/ai-summary?stream=1`,
+      { question, history: historyBefore },
+      {
+        onToken(text: string) {
+          const session = activeSession.value;
+          if (!session) return;
+          const msgs = session.messages;
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.role === "assistant") {
+            lastMsg.content += text;
+          }
+          scrollChatToBottom();
+        },
+        onDone(result: AiSummaryResult) {
+          streamSucceeded = true;
+          streaming.value = false;
+          updateActiveSession((session) => {
+            const msgs = session.messages;
+            const lastMsg = msgs[msgs.length - 1];
+            if (lastMsg && lastMsg.role === "assistant") {
+              // Prefer the streamed content unless result.reply has more text
+              if (result.reply && result.reply.length > (lastMsg.content || "").length) {
+                lastMsg.content = result.reply;
+              } else if (result.reply && !lastMsg.content) {
+                lastMsg.content = result.reply;
+              }
+              lastMsg.strengths = result.strengths;
+              lastMsg.risks = result.risks;
+              lastMsg.improvements = result.improvements;
+            }
+          });
+          scrollChatToBottom();
+        },
+        onError(message: string) {
+          streaming.value = false;
+          chatError.value = message;
+          updateActiveSession((session) => {
+            const msgs = session.messages;
+            const lastMsg = msgs[msgs.length - 1];
+            if (lastMsg && lastMsg.role === "assistant" && !lastMsg.content.trim()) {
+              lastMsg.content = "AI 回复生成失败";
+            }
+          });
+        },
       }
-    });
+    );
+  } catch (e) {
+    streaming.value = false;
+    // SSE failed — fall back to non-streaming API with typewriter effect
+    if (!streamSucceeded) {
+      try {
+        const result = await apiPost<AiSummaryResult>(`/plans/${props.planId}/ai-summary`, {
+          question,
+          history: historyBefore,
+        });
+        updateActiveSession((session) => {
+          const msgs = session.messages;
+          const lastMsg = msgs[msgs.length - 1];
+          if (!lastMsg || lastMsg.role !== "assistant") return;
+          lastMsg.strengths = [];
+          lastMsg.risks = [];
+          lastMsg.improvements = [];
+        });
+        streaming.value = true;
+        const session = activeSession.value;
+        const lastMsg = session?.messages[session.messages.length - 1];
+        if (lastMsg && lastMsg.role === "assistant") {
+          await playTypewriter(lastMsg, result);
+          saveSessionsToStorage();
+        }
+      } catch (e2) {
+        chatError.value = e2 instanceof Error ? e2.message : "AI 总结失败，请稍后再试";
+        updateActiveSession((session) => {
+          const msgs = session.messages;
+          const lastMsg = msgs[msgs.length - 1];
+          if (lastMsg && lastMsg.role === "assistant" && !lastMsg.content.trim()) {
+            lastMsg.content = "AI 回复生成失败";
+          }
+        });
+      }
+    }
   } finally {
     sending.value = false;
     streaming.value = false;
@@ -327,13 +396,26 @@ watch(
             class="content"
             :class="{ streaming: streaming && message.role === 'assistant' && index === activeSession.messages.length - 1 }"
           >
-            {{ message.content
-            }}<span
+            <template v-if="message.role === 'assistant' && !streaming && collapsedMessageKeys.has(messageKey(message, index))">
+              {{ message.content.slice(0, 200) }}...
+            </template>
+            <template v-else>
+              {{ message.content }}
+            </template>
+            <span
               v-if="streaming && message.role === 'assistant' && index === activeSession.messages.length - 1 && message.content"
               class="cursor-blink"
               >|</span
             >
           </p>
+          <button
+            v-if="message.role === 'assistant' && message.content.length > 300 && !streaming"
+            type="button"
+            class="toggle-btn"
+            @click="toggleMessageCollapse(messageKey(message, index))"
+          >
+            {{ collapsedMessageKeys.has(messageKey(message, index)) ? "展开全文 ▼" : "收起 ▲" }}
+          </button>
         </li>
       </ul>
     </div>
@@ -538,6 +620,19 @@ h4 {
 .muted {
   margin: 0;
   color: #6b7280;
+}
+.toggle-btn {
+  background: none;
+  border: none;
+  color: #2563eb;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+  text-align: left;
+}
+.toggle-btn:hover {
+  color: #1d4ed8;
+  text-decoration: underline;
 }
 .error {
   margin: 0;
