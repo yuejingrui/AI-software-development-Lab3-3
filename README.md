@@ -172,9 +172,35 @@ tcb fn deploy api-http
 tcb hosting deploy frontend/dist -e lab3-3-d5gdcm7qo10ced8af
 ```
 
+## 云函数调用查看
+
+### CloudBase 控制台（推荐）
+
+1. 进入 [CloudBase 控制台](https://console.cloud.tencent.com/tcb) → 选择环境 `lab3-3-d5gdcm7qo10ced8af`
+2. 左侧菜单 **云函数** → 点击函数名 `api-http` → **日志** 标签页
+3. 可按时间范围、调用状态（成功/失败）筛选，支持关键词搜索
+4. **监控** 标签页可查看调用次数、错误率、平均耗时等指标
+
+### CloudBase CLI
+
+```bash
+# 查看 api-http 云函数最近日志
+tcb fn log api-http --limit 20
+
+# 查看最近 1 小时的日志
+tcb fn log api-http --start-time "1 hour ago" --limit 50
+
+# 实时监听日志（类似 tail -f）
+tcb fn log api-http --follow
+```
+
+### HTTP 访问服务日志
+
+`api-http` 作为 HTTP 云函数，其请求日志也可在 **CloudBase 控制台 → HTTP 访问服务 → 访问日志** 中查看，包含请求路径、状态码、耗时等信息。
+
 ## 环境变量
 
-所有密钥均通过环境变量注入，云端在 CloudBase 控制台 → 云函数 → 环境变量中配置。详见 `.env.example`。
+所有密钥均通过环境变量注入，云端在 CloudBase 控制台 → 云函数 → 函数配置 → 环境变量中配置。详见 `.env.example`。
 
 ## 页面路由
 
